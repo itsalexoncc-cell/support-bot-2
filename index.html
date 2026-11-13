@@ -1,0 +1,610 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>Смарт Деним</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    :root {
+      --bg: var(--tg-theme-secondary-bg-color, #f1f1f4);
+      --card: var(--tg-theme-bg-color, #fff);
+      --tx: var(--tg-theme-text-color, #111);
+      --hint: var(--tg-theme-hint-color, #8a8a93);
+      --ac: var(--tg-theme-button-color, #2f80ed);
+      --act: var(--tg-theme-button-text-color, #fff);
+      --r: 22px;
+      --page: var(--bg);
+      --panel: var(--card);
+      --tint: var(--card);
+      --glass: var(--card);
+    }
+    @supports (background: color-mix(in srgb, red, blue)) {
+      :root {
+        --page: color-mix(in srgb, var(--ac) 22%, var(--card));
+        --panel: color-mix(in srgb, var(--ac) 12%, var(--card));
+        --tint: color-mix(in srgb, var(--ac) 32%, var(--card));
+        --glass: color-mix(in srgb, var(--card) 75%, transparent);
+      }
+    }
+    * { box-sizing: border-box; margin: 0; -webkit-tap-highlight-color: transparent; }
+    html { background: var(--page); height: 100%; }
+    body {
+      background: var(--page);
+      color: var(--tx);
+      font: 15px/1.3 -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
+      height: var(--tg-viewport-height, 100vh);
+      overflow: hidden;
+      padding: 8px 12px calc(env(safe-area-inset-bottom, 0px) + 14px);
+    }
+    #app { height: 100%; display: flex; flex-direction: column; gap: 10px; max-width: 480px; margin: 0 auto; }
+    button, select { font-family: inherit; cursor: pointer; }
+    svg.i { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+
+    #stage { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+    #body { flex: 1; min-height: 0; display: none; flex-direction: column; }
+    #list { flex: 1; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; padding-bottom: 4px; }
+    #list::-webkit-scrollbar { display: none; }
+
+    .hero {
+      flex: none;
+      position: relative;
+      border-radius: 34px;
+      padding: 18px 16px 16px;
+      background: linear-gradient(180deg, var(--tint), var(--panel) 75%);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 18px;
+      box-shadow: 0 6px 20px rgba(0,0,0,.06);
+    }
+    .hero-top { display: flex; flex-direction: column; align-items: center; }
+    .hero .ib { position: absolute; top: 14px; right: 14px; }
+    .ib {
+      border: 0; background: var(--glass); color: var(--tx);
+      width: 42px; height: 42px; border-radius: 50%;
+      display: flex; align-items: center; justify-content: center; flex: none; transition: transform .12s;
+    }
+    .ib:active { transform: scale(.92); }
+    .av {
+      width: 80px; height: 80px; border-radius: 50%;
+      background: var(--ac); color: var(--act);
+      display: flex; align-items: center; justify-content: center;
+      font-weight: 600; font-size: 30px; flex: none; overflow: hidden;
+    }
+    .av.s { width: 44px; height: 44px; font-size: 18px; }
+    .av img { width: 100%; height: 100%; object-fit: cover; }
+    h1 { font-size: 23px; font-weight: 600; margin-top: 10px; text-align: center; letter-spacing: -.01em; }
+    .subl { color: var(--hint); font-size: 14px; margin-top: 2px; text-align: center; }
+
+    .acts { display: flex; gap: 28px; }
+    .acts button, .acts span.off {
+      border: 0; background: none; padding: 0;
+      display: flex; flex-direction: column; align-items: center; gap: 6px;
+      color: var(--tx); font-size: 13px;
+    }
+    .acts .b {
+      width: 76px; height: 52px; border-radius: 26px;
+      background: var(--glass); color: var(--ac);
+      display: flex; align-items: center; justify-content: center; transition: transform .12s;
+    }
+    .acts button:active .b { transform: scale(.94); }
+    .acts .off { opacity: .4; }
+
+    .bio { align-self: stretch; background: var(--glass); border-radius: 20px; padding: 12px 16px; }
+    .bio small { color: var(--hint); font-size: 13px; display: block; }
+    .bio p { margin-top: 3px; font-size: 15px; line-height: 1.35; word-break: break-word; }
+    .bio p+p { margin-top: 1px; }
+    .bio .none { color: var(--hint); }
+
+    .sh { flex: none; display: flex; align-items: center; justify-content: space-between; padding: 2px 4px 8px; min-height: 36px; }
+    .sec { font-weight: 700; font-size: 20px; }
+    .add { border: 0; background: var(--glass); color: var(--ac); font-weight: 600; font-size: 14px; border-radius: 14px; padding: 7px 14px; }
+
+    .row {
+      display: flex; align-items: center; gap: 12px;
+      background: var(--panel); border-radius: var(--r);
+      padding: 10px 12px; margin-bottom: 8px; box-shadow: 0 2px 10px rgba(0,0,0,.04);
+    }
+    .row.off { opacity: .55; }
+    .nm { flex: 1; min-width: 0; }
+    .nm b, .nm small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .nm small { color: var(--hint); }
+    .hide, .rn { border: 0; background: var(--glass); color: var(--ac); width: 36px; height: 36px; border-radius: 50%; display: flex; align-items: center; justify-content: center; flex: none; transition: transform .12s; }
+    .hide:active, .rn:active { transform: scale(.9); }
+    .hide svg.i, .rn svg.i { width: 19px; height: 19px; }
+    .del svg { pointer-events: none; }
+    .del svg.i { width: 18px; height: 18px; display: block; }
+    .item b span.del { display: flex; align-items: center; }
+    .empty { background: var(--panel); border-radius: var(--r); color: var(--hint); text-align: center; padding: 28px 14px; }
+    .txt { white-space: pre-wrap; margin-top: 4px; word-break: break-word; }
+    .item { background: var(--panel); border-radius: var(--r); padding: 12px 14px; margin-bottom: 8px; box-shadow: 0 2px 10px rgba(0,0,0,.04); }
+    .item b { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+    .item b span.del { color: var(--hint); padding: 0 4px; cursor: pointer; }
+    .badge { display: inline-block; font-size: 12px; font-weight: 600; color: var(--ac); background: var(--glass); padding: 3px 9px; border-radius: 10px; }
+
+    /* Панель навигации: радиусы вложены (30 → 24), отступы от скруглённых углов шторки iOS */
+    .dock { width: 100%; flex: none; padding: 0 2px; }
+    .nav {
+      width: 100%; display: flex; gap: 4px; padding: 6px;
+      border-radius: 32px; background: var(--panel);
+      box-shadow: 0 6px 20px rgba(0,0,0,.08);
+    }
+    @supports (backdrop-filter: blur(10px)) {
+      .nav {
+        background: color-mix(in srgb, var(--panel) 85%, transparent);
+        backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
+      }
+    }
+    .nav button {
+      flex: 1; min-width: 0; border: 0; background: none; color: var(--hint);
+      border-radius: 26px; padding: 9px 2px 8px;
+      display: flex; flex-direction: column; align-items: center; gap: 4px;
+      font-size: 11px; font-weight: 500; transition: background .15s, color .15s, box-shadow .15s;
+    }
+    .nav button.on {
+      background: var(--card); color: var(--ac);
+      box-shadow: 0 4px 12px rgba(0,0,0,.16), 0 1px 3px rgba(0,0,0,.10);
+    }
+    .nav svg.i { width: 24px; height: 24px; }
+
+    .sub-wrap { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; padding-bottom: 6px; }
+    .sub-wrap::-webkit-scrollbar { display: none; }
+    .sub-head { display: flex; align-items: center; gap: 12px; padding: 2px 2px 0; flex: none; }
+    .stitle { font-size: 22px; font-weight: 700; }
+    .fcard {
+      border-radius: 30px; padding: 16px;
+      background: linear-gradient(180deg, var(--tint), var(--panel) 75%);
+      box-shadow: 0 6px 20px rgba(0,0,0,.06);
+      display: flex; flex-direction: column; gap: 10px; flex: none;
+    }
+    .fgrp { display: flex; flex-direction: column; gap: 4px; }
+    label { color: var(--hint); font-size: 13px; font-weight: 500; padding-left: 6px; }
+    input, textarea, select {
+      width: 100%; font: inherit; color: var(--tx); background: var(--glass);
+      border: 1.5px solid transparent; border-radius: 16px; padding: 11px 14px; outline: none;
+      transition: border-color .15s, background .15s;
+    }
+    input:focus, textarea:focus, select:focus { border-color: var(--ac); background: var(--card); }
+    .btn {
+      border: 0; font: inherit; font-weight: 600; background: var(--ac); color: var(--act);
+      border-radius: 18px; padding: 12px; width: 100%; transition: transform .12s;
+    }
+    .btn:active { transform: scale(.98); }
+    .btn.ghost { background: var(--glass); color: var(--ac); }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+  <script>
+    // Адрес вашего воркера на Cloudflare (без слэша в конце)
+    var API_BASE = 'https://YOUR-WORKER.workers.dev';
+
+    var tg = window.Telegram && Telegram.WebApp,
+        app = document.getElementById('app'),
+        me = null,
+        cache = {},          // данные вкладок: грузятся один раз при запуске
+        photos = {},         // промисы фото
+        photoUrls = {},      // готовые ссылки на фото
+        back = null,
+        tab = 'home',
+        seq = 0;
+
+    var URLS = {
+      colleagues: '/api/colleagues',
+      pins: '/api/pins',
+      notifications: '/api/content/notifications'
+    };
+
+    function esc(s) {
+      return String(s == null ? '' : s).replace(/[&<>"]/g, function(c) {
+        return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];
+      });
+    }
+    function $(id) { return document.getElementById(id); }
+
+    function api(p, o) {
+      o = o || {};
+      o.headers = {'Authorization': 'tma ' + tg.initData, 'Content-Type': 'application/json'};
+      return fetch(API_BASE + p, o).then(function(r) {
+        if (r.ok) return r;
+        return r.text().then(function(t) {
+          var e = new Error('http');
+          e.status = r.status;
+          try { e.msg = JSON.parse(t).error; } catch(_) {}
+          throw e;
+        });
+      });
+    }
+    function j(p, o) { return api(p, o).then(function(r) { return r.json(); }); }
+    function msg(t) { tg.showAlert ? tg.showAlert(t) : alert(t); }
+
+    // Кэш: повторный запрос идёт в сеть только при force
+    function getData(key, force) {
+      if (!force && cache[key]) return Promise.resolve(cache[key]);
+      return j(URLS[key]).then(function(d) { return (cache[key] = d.items); });
+    }
+
+    function fail(e) {
+      app.innerHTML = '<div class="empty">' + (e && e.status === 403 ? 'Нет доступа.<br>Сначала напишите боту любое сообщение.' : 'Не удалось загрузить. Закройте и откройте снова.') + '</div>';
+    }
+
+    function av(ref, ch, cls) {
+      var inner = photoUrls[ref] ? '<img src="' + photoUrls[ref] + '" alt="">' : esc(ch);
+      return '<div class="av' + (cls ? ' ' + cls : '') + '" data-ref="' + esc(ref) + '">' + inner + '</div>';
+    }
+
+    function photoLoad(r) {
+      if (!photos[r]) {
+        photos[r] = api('/api/photo/' + r)
+          .then(function(x) { return x.blob(); })
+          .then(function(b) { return (photoUrls[r] = URL.createObjectURL(b)); })
+          .catch(function() { return null; });
+      }
+      return photos[r];
+    }
+
+    function photosLoad() {
+      [].forEach.call(app.querySelectorAll('.av[data-ref]'), function(el) {
+        var r = el.getAttribute('data-ref');
+        if (photoUrls[r]) return;
+        photoLoad(r).then(function(u) { if (u && el.isConnected) el.innerHTML = '<img src="' + u + '" alt="">'; });
+      });
+    }
+
+    function hex2rgb(s) {
+      s = (s || '').replace('#', '');
+      if (s.length === 3) s = s.replace(/./g, '$&$&');
+      return s.length === 6 ? [0, 2, 4].map(function(i) { return parseInt(s.substr(i, 2), 16); }) : null;
+    }
+    function mix(a, b, p) {
+      return '#' + a.map(function(v, i) {
+        var x = Math.round(v * p + b[i] * (1 - p));
+        return (x < 16 ? '0' : '') + x.toString(16);
+      }).join('');
+    }
+
+    function applyTheme() {
+      var t = tg.themeParams || {}, ac = hex2rgb(t.button_color), bg = hex2rgb(t.bg_color);
+      if (!ac || !bg) return;
+      var s = document.documentElement.style, page = mix(ac, bg, .22);
+      s.setProperty('--page', page);
+      s.setProperty('--panel', mix(ac, bg, .12));
+      s.setProperty('--tint', mix(ac, bg, .32));
+      try { tg.setBackgroundColor(page); } catch(e) {}
+      try { tg.setHeaderColor(page); } catch(e) {}
+      try { if (tg.setBottomBarColor) tg.setBottomBarColor(page); } catch(e) {}
+    }
+
+    function setBack(on) {
+      if (!tg.BackButton) return;
+      if (back) tg.BackButton.offClick(back);
+      if (on) { back = shell; tg.BackButton.onClick(back); tg.BackButton.show(); }
+      else tg.BackButton.hide();
+    }
+
+    var IC = {
+      tel: '<path d="M22 16.9v3a2 2 0 01-2.2 2 19.8 19.8 0 01-8.6-3.1 19.5 19.5 0 01-6-6A19.8 19.8 0 012.1 4.2 2 2 0 014.1 2h3a2 2 0 012 1.7c.1 1 .4 1.9.7 2.8a2 2 0 01-.5 2.1L8.1 9.9a16 16 0 006 6l1.3-1.3a2 2 0 012.1-.4c.9.3 1.8.6 2.8.7a2 2 0 011.7 2z"/>',
+      mail: '<rect x="3" y="5" width="18" height="14" rx="2.5"/><path d="M3.5 7l8.5 6 8.5-6"/>',
+      edit: '<path d="M4 20l1-4L16 5l3 3L8 19l-4 1z"/><path d="M14 7l3 3"/>',
+      back: '<path d="M15 18l-6-6 6-6"/>',
+      close: '<path d="M6 6l12 12M18 6L6 18"/>',
+      eye: '<path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z"/><circle cx="12" cy="12" r="2.8"/>',
+      eyeoff: '<path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z"/><circle cx="12" cy="12" r="2.8"/><path d="M4 4l16 16"/>',
+      home: '<path d="M4 11l8-7 8 7"/><path d="M6.5 9.5V19.5h11V9.5"/>',
+      pins: '<path d="M9 4h6l-1 6 3 3H7l3-3-1-6z"/><path d="M12 13v7"/>',
+      colleagues: '<circle cx="9.5" cy="9" r="3"/><path d="M4 19c.5-3 2.8-4.5 5.5-4.5s5 1.5 5.5 4.5"/><path d="M16 6.2a3 3 0 010 5.6M18 14.8c1.6.6 2.6 1.9 3 4.2"/>',
+      notifications: '<path d="M7 17v-6a5 5 0 0110 0v6"/><path d="M5 17h14"/><path d="M10.5 20.5h3"/>'
+    };
+    function ico(k) { return '<svg class="i" viewBox="0 0 24 24">' + IC[k] + '</svg>'; }
+
+    var TABS = [['home', 'Главная'], ['pins', 'Закреп'], ['colleagues', 'Коллектив'], ['notifications', 'Уведомления']];
+
+    function copyText(v) {
+      var ok = false;
+      try {
+        var t = document.createElement('textarea');
+        t.value = v; t.style.cssText = 'position:fixed;opacity:0';
+        document.body.appendChild(t); t.focus(); t.select();
+        ok = document.execCommand('copy');
+        document.body.removeChild(t);
+      } catch(e) {}
+      if (ok) msg('Скопировано');
+      else if (navigator.clipboard) navigator.clipboard.writeText(v).then(function() { msg('Скопировано'); }, function() { msg(v); });
+      else msg(v);
+    }
+
+    function contact(kind, val) {
+      var url = (kind === 'tel' ? 'tel:' : 'mailto:') + val,
+          go = kind === 'tel' ? 'Позвонить' : 'Написать письмо',
+          cp = kind === 'tel' ? 'Скопировать номер' : 'Скопировать адрес';
+      function act(id) {
+        if (id === 'go') { try { tg.openLink(url); } catch(e) { location.href = url; } }
+        else if (id === 'cp') copyText(val);
+      }
+      if (tg.showPopup) {
+        tg.showPopup({
+          title: val, message: 'Что сделать?',
+          buttons: [{id: 'go', type: 'default', text: go}, {id: 'cp', type: 'default', text: cp}, {type: 'cancel'}]
+        }, act);
+      } else if (confirm(go + '?')) act('go');
+    }
+
+    function act(kind, val, label) {
+      if (!val) return '<span class="off"><span class="b">' + ico(kind) + '</span>' + label + '</span>';
+      return '<button type="button" data-c="' + kind + '" data-v="' + esc(val) + '"><span class="b">' + ico(kind) + '</span>' + label + '</button>';
+    }
+
+    function shell() {
+      setBack(false);
+      var h = me.header;
+      app.innerHTML =
+        '<div id="stage">' +
+          '<div class="hero" id="hero">' +
+            (me.isAdmin ? '<button class="ib" id="ed" aria-label="Редактировать">' + ico('edit') + '</button>' : '') +
+            '<div class="hero-top">' +
+              av('bot', (me.bot || 'Б').charAt(0).toUpperCase()) +
+              '<h1>' + esc(me.bot) + '</h1>' +
+              '<div class="subl">Центр управления общением</div>' +
+            '</div>' +
+            '<div class="acts">' + act('tel', h.phone, 'Позвонить') + act('mail', h.email, 'Написать') + '</div>' +
+            '<div class="bio"><small>Информация</small>' +
+              ((h.title || h.company)
+                ? (h.title ? '<p><b>' + esc(h.title) + '</b></p>' : '') + (h.company ? '<p>' + esc(h.company) + '</p>' : '')
+                : '<p class="none">Не заполнено</p>') +
+            '</div>' +
+          '</div>' +
+          '<div id="body"></div>' +
+        '</div>' +
+        '<div class="dock"><nav class="nav">' +
+          TABS.map(function(t) { return '<button data-tab="' + t[0] + '">' + ico(t[0]) + t[1] + '</button>'; }).join('') +
+        '</nav></div>';
+
+      photosLoad();
+      app.onclick = function(e) {
+        var t = e.target.closest('[data-tab]');
+        if (t) { tab = t.getAttribute('data-tab'); showTab(); return; }
+        var c = e.target.closest('[data-c]');
+        if (c) { contact(c.getAttribute('data-c'), c.getAttribute('data-v')); return; }
+        if (e.target.closest('#ed')) editHeader();
+      };
+      showTab();
+    }
+
+    function showTab() {
+      seq++;
+      var my = seq;
+      [].forEach.call(app.querySelectorAll('.nav button'), function(b) {
+        b.classList.toggle('on', b.getAttribute('data-tab') === tab);
+      });
+      var hero = $('hero'), body = $('body');
+      if (tab === 'home') {
+        hero.style.display = 'flex';
+        body.style.display = 'none';
+        body.innerHTML = '';
+        return;
+      }
+      hero.style.display = 'none';
+      body.style.display = 'flex';
+      var title = TABS.filter(function(t) { return t[0] === tab; })[0][1],
+          canAdd = (tab === 'notifications' || tab === 'pins') && me.isAdmin;
+      body.innerHTML =
+        '<div class="sh"><div class="sec">' + title + '</div>' +
+        (canAdd ? '<button class="add" id="add">Добавить</button>' : '') +
+        '</div><div id="list"></div>';
+      if (tab === 'pins') pinsView(my);
+      else if (tab === 'notifications') content(tab, my);
+      else people(tab, my);
+    }
+
+    // Рисует список сразу из кэша; спиннер только если кэша нет (ошибка первой загрузки)
+    function withData(key, my, draw) {
+      var list = $('list');
+      if (cache[key]) return draw(cache[key]);
+      list.innerHTML = '<div class="empty">Загрузка…</div>';
+      getData(key).then(function(items) { if (my === seq) draw(items); })
+        .catch(function() { if (my === seq) list.innerHTML = '<div class="empty">Не удалось загрузить.</div>'; });
+    }
+
+    function pinsView(my) {
+      var list = $('list');
+      function draw() {
+        var items = cache.pins || [];
+        if (!items.length) { list.innerHTML = '<div class="empty">Закреплённых сообщений пока нет.</div>'; return; }
+        list.innerHTML = items.map(function(p) {
+          return '<div class="item"><b>' +
+              '<span>' + (p.who ? '<span class="badge">' + esc(p.who) + '</span>' : '📌 Важное') + '</span>' +
+              '<span class="del" data-dp="' + p.id + '">' + ico('close') + '</span>' +
+            '</b><div class="txt">' + esc(p.text) + '</div></div>';
+        }).join('');
+      }
+      list.onclick = function(e) {
+        var dp = e.target.getAttribute('data-dp');
+        if (!dp) return;
+        tg.showConfirm('Убрать сообщение из закрепа?', function(ok) {
+          if (!ok) return;
+          api('/api/pins?id=' + dp, {method: 'DELETE'}).then(function() {
+            cache.pins = cache.pins.filter(function(p) { return String(p.id) !== dp; });
+            if (my === seq) draw();
+          }).catch(function() { msg('Не удалось удалить'); });
+        });
+      };
+      withData('pins', my, draw);
+
+      var add = $('add');
+      if (add) add.onclick = function() {
+        getData('colleagues').then(function(users) {
+          var opts = '<option value="all">Всем сотрудникам</option>' +
+            users.map(function(u) { return '<option value="' + esc(u.ref) + '">' + esc(u.name) + '</option>'; }).join('');
+          sub('Новый закреп',
+            '<div class="fgrp"><label>Кому закрепить</label><select id="pr">' + opts + '</select></div>' +
+            '<div class="fgrp"><label>Текст сообщения</label><textarea id="px" rows="4" maxlength="1000" placeholder="Введите текст закрепа"></textarea></div>' +
+            '<button class="btn" id="ok">Закрепить</button>'
+          );
+          $('ok').onclick = function() {
+            var ref = $('pr').value, txt = $('px').value.trim();
+            if (!txt) return msg('Введите текст сообщения');
+            j('/api/pins', {method: 'POST', body: JSON.stringify({ref: ref, text: txt})})
+              .then(function() { return getData('pins', true); })
+              .then(shell)
+              .catch(function() { msg('Не удалось сохранить'); });
+          };
+        }).catch(function() { msg('Не удалось загрузить список сотрудников'); });
+      };
+    }
+
+    function people(kind, my) {
+      var list = $('list');
+      function draw(items) {
+        if (!items.length) { list.innerHTML = '<div class="empty">Список пуст.</div>'; return; }
+        list.innerHTML = items.map(function(u) {
+          var adm = me.isAdmin, st = u.blocked ? 'заблокировал бота' : (u.hidden ? 'скрыт' : '');
+          return '<div class="row' + (u.hidden || u.blocked ? ' off' : '') + '" data-u="' + esc(u.username || '') + '" data-r="' + esc(u.ref) + '" data-n="' + esc(u.name) + '">' +
+            av(u.ref, u.initial, 's') +
+            '<div class="nm"><b>' + esc(u.name) + '</b>' +
+              (u.username ? '<small>@' + esc(u.username) + '</small>' : '') +
+              (adm && st ? '<small class="st">' + st + '</small>' : '') +
+            '</div>' +
+            (adm ? '<button class="rn" aria-label="Изменить">' + ico('edit') + '</button>' : '') +
+            (adm ? '<button class="hide" aria-label="Скрыть" data-h="' + (u.hidden ? 1 : 0) + '">' + ico(u.hidden ? 'eyeoff' : 'eye') + '</button>' : '') +
+          '</div>';
+        }).join('');
+        photosLoad();
+      }
+      list.onclick = function(e) {
+        var row = e.target.closest('.row');
+        if (!row) return;
+        var ref = row.getAttribute('data-r');
+        if (e.target.closest('.rn')) { renameView(ref, row.getAttribute('data-n'), row.getAttribute('data-u')); return; }
+        var hb = e.target.closest('.hide');
+        if (hb) {
+          var cur = hb.getAttribute('data-h') === '1';
+          api('/api/hide', {method: 'POST', body: JSON.stringify({ref: ref, hidden: !cur})}).then(function() {
+            cache.colleagues.forEach(function(u) { if (u.ref === ref) u.hidden = !cur; });
+            draw(cache.colleagues);
+          }).catch(function() { msg('Не удалось сохранить'); });
+          return;
+        }
+        var u = row.getAttribute('data-u');
+        if (u) tg.openTelegramLink('https://t.me/' + u);
+        else msg('У сотрудника не указан username');
+      };
+      withData(kind, my, draw);
+    }
+
+    function sub(t, html) {
+      setBack(true);
+      app.onclick = null;
+      app.innerHTML =
+        '<div class="sub-wrap">' +
+          '<div class="sub-head"><button class="ib" id="bk" aria-label="Назад">' + ico('back') + '</button><div class="stitle">' + t + '</div></div>' +
+          '<div class="fcard" id="sb">' + html + '</div>' +
+        '</div>';
+      $('bk').onclick = shell;
+    }
+
+    function renameView(ref, cur, un) {
+      sub('Данные коллеги',
+        '<div class="fgrp"><label>Имя (видят все)</label><input id="nm" maxlength="60" value="' + esc(cur) + '"></div>' +
+        '<div class="fgrp"><label>Username в Telegram, без @</label><input id="un" maxlength="40" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="например ivan_petrov" value="' + esc(un) + '"></div>' +
+        '<button class="btn" id="ok">Сохранить</button>' +
+        '<button class="btn ghost" id="rs">Сбросить к данным Telegram</button>'
+      );
+      function send(b) {
+        b.ref = ref;
+        j('/api/rename', {method: 'POST', body: JSON.stringify(b)})
+          .then(function() { return getData('colleagues', true); })
+          .then(shell)
+          .catch(function(e) {
+            msg(e && e.msg && /[а-яА-Я]/.test(e.msg) ? e.msg : 'Не удалось сохранить (ошибка ' + ((e && e.status) || 'сети') + ')');
+          });
+      }
+      $('ok').onclick = function() {
+        var v = $('nm').value.trim(), u = $('un').value.trim().replace(/^@/, ''), b = {};
+        if (!v) return msg('Введите имя');
+        if (v !== cur) b.name = v;
+        if (u !== un) b.username = u;
+        if (!b.name && b.username === undefined) return shell();
+        send(b);
+      };
+      $('rs').onclick = function() { send({name: '', username: ''}); };
+    }
+
+    function content(kind, my) {
+      var list = $('list');
+      function draw() {
+        var items = cache[kind] || [];
+        list.innerHTML = items.length ? items.map(function(it, i) {
+          return '<div class="item"><b><span>' + esc(it.title) + '</span>' + (me.isAdmin ? '<span class="del" data-d="' + i + '">' + ico('close') + '</span>' : '') + '</b><div class="txt">' + esc(it.text) + '</div></div>';
+        }).join('') : '<div class="empty">Пока ничего нет.</div>';
+      }
+      function save(next, done) {
+        j('/api/content/' + kind, {method: 'PUT', body: JSON.stringify({items: next})}).then(function() {
+          cache[kind] = next;
+          done();
+        }).catch(function() { msg('Не удалось сохранить'); });
+      }
+      list.onclick = function(e) {
+        var i = e.target.getAttribute('data-d');
+        if (i !== null) tg.showConfirm('Удалить запись?', function(ok) {
+          if (ok) save(cache[kind].filter(function(_, k) { return k != i; }), draw);
+        });
+      };
+      withData(kind, my, draw);
+      var add = $('add');
+      if (add) add.onclick = function() {
+        sub('Новое уведомление',
+          '<div class="fgrp"><label>Заголовок</label><input id="t" maxlength="80" placeholder="Введите заголовок"></div>' +
+          '<div class="fgrp"><label>Текст уведомления</label><textarea id="x" rows="4" maxlength="1000" placeholder="Введите текст"></textarea></div>' +
+          '<button class="btn" id="ok">Сохранить</button>'
+        );
+        $('ok').onclick = function() {
+          var t = $('t').value.trim(), x = $('x').value.trim();
+          if (!t || !x) return msg('Заполните заголовок и текст');
+          save([{title: t, text: x}].concat(cache[kind] || []), shell);
+        };
+      };
+    }
+
+    function editHeader() {
+      var h = me.header,
+          f = [['title', 'Должность'], ['company', 'Место работы'], ['phone', 'Телефон'], ['email', 'Почта']];
+      sub('Информация',
+        f.map(function(x) {
+          return '<div class="fgrp"><label>' + x[1] + '</label><input id="f_' + x[0] + '" value="' + esc(h[x[0]]) + '"></div>';
+        }).join('') + '<button class="btn" id="ok">Сохранить</button>'
+      );
+      $('ok').onclick = function() {
+        var b = {};
+        f.forEach(function(x) { b[x[0]] = $('f_' + x[0]).value.trim(); });
+        j('/api/header', {method: 'PUT', body: JSON.stringify(b)}).then(function(r) {
+          me.header = r.header;
+          shell();
+        }).catch(function(e) {
+          msg(e && e.msg && /[а-яА-Я]/.test(e.msg) ? e.msg : 'Не удалось сохранить (ошибка ' + ((e && e.status) || 'сети') + ')');
+        });
+      };
+    }
+
+    // ---- запуск: всё грузится один раз ----
+    if (!tg || !tg.initData) {
+      app.innerHTML = '<div class="empty">Откройте приложение через кнопку меню в Telegram.</div>';
+    } else {
+      tg.ready();
+      tg.expand && tg.expand();
+      applyTheme();
+      tg.onEvent && tg.onEvent('themeChanged', applyTheme);
+      app.innerHTML = '<div class="empty">Загрузка…</div>';
+      var quiet = function(k) { return getData(k).catch(function() { return null; }); };
+      Promise.all([j('/api/me'), quiet('colleagues'), quiet('pins'), quiet('notifications')])
+        .then(function(r) {
+          me = r[0];
+          photoLoad('bot');
+          (r[1] || []).forEach(function(u) { photoLoad(u.ref); });
+          shell();
+        })
+        .catch(fail);
+    }
+  </script>
+</body>
+</html>
