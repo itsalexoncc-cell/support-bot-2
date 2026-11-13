@@ -324,7 +324,7 @@
       }
       if (tg.showPopup) {
         tg.showPopup({
-          title: val, message: 'Что сделать?',
+          title: val, message: '\u2800',
           buttons: [{id: 'go', type: 'default', text: go}, {id: 'cp', type: 'default', text: cp}, {type: 'cancel'}]
         }, act);
       } else if (confirm(go + '?')) act('go');
