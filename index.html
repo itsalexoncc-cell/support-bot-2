@@ -1,610 +1,923 @@
-<!doctype html>
-<html lang="ru">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-  <title>Смарт Деним</title>
-  <script src="https://telegram.org/js/telegram-web-app.js"></script>
-  <style>
-    :root {
-      --bg: var(--tg-theme-secondary-bg-color, #f1f1f4);
-      --card: var(--tg-theme-bg-color, #fff);
-      --tx: var(--tg-theme-text-color, #111);
-      --hint: var(--tg-theme-hint-color, #8a8a93);
-      --ac: var(--tg-theme-button-color, #2f80ed);
-      --act: var(--tg-theme-button-text-color, #fff);
-      --r: 22px;
-      --page: var(--bg);
-      --panel: var(--card);
-      --tint: var(--card);
-      --glass: var(--card);
+// Cloudflare Worker: бот обратной связи (замена Livegram)
+// D1-привязка: BD. Секреты: BOT_TOKEN, GROUP_ID, WEBHOOK_SECRET.
+// Необязательные переменные: WELCOME, AUTOREPLY, TZ_OFFSET (часы от UTC, по умолчанию 3 = Москва).
+// Для рассылок нужен Cron Trigger "* * * * *".
+// Mini App теперь лежит на GitHub Pages (файл index.html). Воркер отдаёт только API.
+// Переменная APP_URL: адрес Mini App (по умолчанию https://itsalexoncc-cell.github.io/support-bot-2/).
+// Доп. секрет: ADMIN_USER_ID (Telegram ID владельца; несколько аккаунтов: через запятую).
+
+const BATCH = 45; // сообщений рассылки за один запуск (лимит подзапросов на free-плане: 50)
+const AUTOREPLY_EVERY = 6 * 3600; // автоответ одному клиенту не чаще раза в 6 часов
+const DEFAULT_APP_URL = 'https://itsalexoncc-cell.github.io/support-bot-2/';
+
+const appUrl = (env) => env.APP_URL || DEFAULT_APP_URL;
+
+// CORS: API вызывается со страницы на github.io, поэтому разрешаем именно этот origin
+const corsHeaders = (env) => ({
+  'Access-Control-Allow-Origin': new URL(appUrl(env)).origin,
+  'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+  'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+  'Access-Control-Max-Age': '86400',
+  'Vary': 'Origin',
+});
+
+const tg = (env, method, body) =>
+  fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  }).then((r) => r.json());
+
+const esc = (s = '') => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const now = () => Math.floor(Date.now() / 1000);
+
+export default {
+  async fetch(req, env, ctx) {
+    const url = new URL(req.url);
+
+    // Установка webhook и меню команд: открыть /setup?key=WEBHOOK_SECRET
+    if (url.pathname === '/setup' && url.searchParams.get('key') === env.WEBHOOK_SECRET) {
+      const set = await tg(env, 'setWebhook', {
+        url: url.origin,
+        secret_token: env.WEBHOOK_SECRET,
+        allowed_updates: ['message', 'edited_message', 'callback_query', 'my_chat_member'],
+      });
+      await tg(env, 'setMyCommands', { commands: [{ command: 'start', description: 'Начать' }] });
+      const cmds = await tg(env, 'setMyCommands', {
+        scope: { type: 'chat', chat_id: Number(env.GROUP_ID) },
+        commands: [
+          { command: 'help', description: 'Список команд' },
+          { command: 'stats', description: 'Статистика' },
+          { command: 'ban', description: 'Заблокировать клиента' },
+          { command: 'unban', description: 'Разблокировать клиента' },
+          { command: 'broadcast', description: 'Рассылка (ответом на сообщение)' },
+          { command: 'settings', description: 'Текущие настройки' },
+          { command: 'setwelcome', description: 'Приветствие на /start' },
+          { command: 'setautoreply', description: 'Автоответ вне рабочего времени' },
+          { command: 'setwork', description: 'Рабочие часы и дни' },
+        ],
+      });
+      const menu = await tg(env, 'setChatMenuButton', {
+        menu_button: { type: 'web_app', text: 'Меню', web_app: { url: appUrl(env) } },
+      });
+      const schema = await ensureSchema(env);
+      const me = await tg(env, 'getMe', {});
+      return new Response(JSON.stringify({ set, cmds, menu, schema, me }, null, 2));
     }
-    @supports (background: color-mix(in srgb, red, blue)) {
-      :root {
-        --page: color-mix(in srgb, var(--ac) 22%, var(--card));
-        --panel: color-mix(in srgb, var(--ac) 12%, var(--card));
-        --tint: color-mix(in srgb, var(--ac) 32%, var(--card));
-        --glass: color-mix(in srgb, var(--card) 75%, transparent);
+
+    if (url.pathname.startsWith('/api/')) {
+      const cors = corsHeaders(env);
+      if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
+      const res = await handleApi(req, env);
+      const out = new Response(res.body, res);
+      for (const [k, v] of Object.entries(cors)) out.headers.set(k, v);
+      return out;
+    }
+
+    // Старый адрес Mini App: отправляем на GitHub Pages
+    if (req.method === 'GET' && url.pathname === '/') return Response.redirect(appUrl(env), 302);
+
+    if (req.method !== 'POST') return new Response('ok');
+    if (req.headers.get('X-Telegram-Bot-Api-Secret-Token') !== env.WEBHOOK_SECRET) {
+      return new Response('forbidden', { status: 403 });
+    }
+    const update = await req.json();
+    ctx.waitUntil(handle(update, env).catch((e) => console.error('handle error', e)));
+    return new Response('ok');
+  },
+
+  // Cron: порционная отправка рассылок
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(tickBroadcast(env).catch((e) => console.error('broadcast error', e)));
+  },
+};
+
+async function handle(update, env) {
+  if (update.my_chat_member) return onMyChatMember(update.my_chat_member, env);
+  if (update.callback_query) return onCallback(update.callback_query, env);
+  if (update.edited_message) return onEdit(update.edited_message, env);
+  const m = update.message;
+  if (!m) return;
+  if (m.chat.type === 'private') return fromUser(m, env);
+  if (String(m.chat.id) === String(env.GROUP_ID)) return fromGroup(m, env);
+}
+
+// ---------- настройки ----------
+async function getSetting(env, key) {
+  const r = await env.BD.prepare('SELECT value FROM settings WHERE key = ?').bind(key).first();
+  return r?.value ?? null;
+}
+const setSetting = (env, key, value) =>
+  env.BD.prepare(
+    'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
+  ).bind(key, value).run();
+const delSetting = (env, key) => env.BD.prepare('DELETE FROM settings WHERE key = ?').bind(key).run();
+
+async function isWorkTime(env) {
+  const hours = await getSetting(env, 'work_hours');
+  if (!hours) return true; // рабочее время не задано -> автоответ не нужен
+  const days = (await getSetting(env, 'work_days')) || '1-7';
+  const [a, b] = hours.split('-').map(Number);
+  const [d1, d2] = days.split('-').map(Number);
+  const tz = Number(env.TZ_OFFSET ?? 3);
+  const t = new Date(Date.now() + tz * 3600 * 1000);
+  const h = t.getUTCHours();
+  const dow = t.getUTCDay() || 7;
+  if (dow < d1 || dow > d2) return false;
+  return a <= b ? h >= a && h < b : h >= a || h < b;
+}
+
+// ---------- клиент -> группа ----------
+async function fromUser(m, env) {
+  const u = await env.BD.prepare(
+    'SELECT topic_id, banned, last_auto_reply FROM users WHERE user_id = ?'
+  ).bind(m.from.id).first();
+  if (u?.banned) return;
+
+  // Если клиент закрепил сообщение у себя в чате — сохраняем в его «Закреп»
+  if (m.pinned_message) {
+    await ensureCustomName(env);
+    const pm = m.pinned_message;
+    const txt = (pm.text || pm.caption || '').trim();
+    if (txt) {
+      await env.BD.prepare(
+        'INSERT INTO pins (user_id, group_msg_id, text, created_at) VALUES (?, ?, ?, ?)'
+      ).bind(m.from.id, pm.message_id, txt, now()).run().catch(() => {});
+    }
+    return;
+  }
+
+  if ((m.text || '').startsWith('/start')) {
+    // Приветствие отключено. Сотрудника тихо регистрируем (топик), чтобы он мог открыть Mini App.
+    if (!u?.topic_id) {
+      await createTopic(m.from, env);
+      await env.BD.prepare('UPDATE users SET first_name = ?, last_name = ?, username = ? WHERE user_id = ?')
+        .bind(m.from.first_name || null, m.from.last_name || null, m.from.username || null, m.from.id).run().catch(() => {});
+    }
+    return;
+  }
+
+  let topicId = u?.topic_id;
+  if (!topicId) topicId = await createTopic(m.from, env);
+
+  // обновляем имя/username для Mini App (не критично для переписки)
+  await env.BD.prepare('UPDATE users SET first_name = ?, last_name = ?, username = ?, blocked_bot = 0 WHERE user_id = ?')
+    .bind(m.from.first_name || null, m.from.last_name || null, m.from.username || null, m.from.id).run().catch(() => {});
+
+  // ответ клиента на конкретное сообщение
+  let replyTo;
+  if (m.reply_to_message) {
+    const row = await env.BD.prepare(
+      'SELECT group_msg_id AS g FROM messages WHERE user_id = ? AND user_msg_id = ?'
+    ).bind(m.from.id, m.reply_to_message.message_id).first();
+    replyTo = row?.g;
+  }
+
+  let r = await copy(env, m.chat.id, m.message_id, env.GROUP_ID, topicId, replyTo);
+  if (!r.ok && /thread not found/i.test(r.description || '')) {
+    topicId = await createTopic(m.from, env); // топик удалили вручную
+    r = await copy(env, m.chat.id, m.message_id, env.GROUP_ID, topicId, replyTo);
+  }
+  if (!r.ok) {
+    console.error('copy to group failed', r);
+    return;
+  }
+  await saveMap(env, m.from.id, m.message_id, r.result.message_id);
+  await env.BD.prepare('UPDATE users SET last_msg_at = ? WHERE user_id = ?').bind(now(), m.from.id).run();
+
+  // автоответ вне рабочего времени
+  const text = (await getSetting(env, 'autoreply')) || env.AUTOREPLY;
+  if (text && !(await isWorkTime(env)) && !(u?.last_auto_reply && now() - u.last_auto_reply < AUTOREPLY_EVERY)) {
+    await tg(env, 'sendMessage', { chat_id: m.chat.id, text });
+    await env.BD.prepare('UPDATE users SET last_auto_reply = ? WHERE user_id = ?').bind(now(), m.from.id).run();
+  }
+}
+
+async function createTopic(u, env) {
+  const fullName = [u.first_name, u.last_name].filter(Boolean).join(' ') || 'Без имени';
+  const title = (u.username ? `${fullName} (@${u.username})` : fullName).slice(0, 128);
+
+  const res = await tg(env, 'createForumTopic', { chat_id: env.GROUP_ID, name: title });
+  if (!res.ok) throw new Error('createForumTopic: ' + res.description);
+  const topicId = res.result.message_thread_id;
+
+  await env.BD.prepare(
+    `INSERT INTO users (user_id, topic_id, name) VALUES (?, ?, ?)
+     ON CONFLICT(user_id) DO UPDATE SET topic_id = excluded.topic_id, name = excluded.name`
+  ).bind(u.id, topicId, title).run();
+
+  await tg(env, 'sendMessage', {
+    chat_id: env.GROUP_ID,
+    message_thread_id: topicId,
+    parse_mode: 'HTML',
+    text:
+      `👤 <a href="tg://user?id=${u.id}">${esc(fullName)}</a>\n` +
+      `ID: <code>${u.id}</code>\n` +
+      (u.username ? `Username: @${esc(u.username)}\n` : '') +
+      `\n<i>Сообщения, начинающиеся с //, пользователю не отправляются.</i>`,
+  });
+  return topicId;
+}
+
+// ---------- группа -> клиент ----------
+async function fromGroup(m, env) {
+  if (m.from?.is_bot && !m.sender_chat) return;
+  if (
+    m.forum_topic_created || m.forum_topic_edited || m.forum_topic_closed ||
+    m.forum_topic_reopened || m.general_forum_topic_hidden || m.general_forum_topic_unhidden
+  ) return;
+
+  // Если в топике клиента закрепили сообщение — добавляем его в раздел «Закреп» для этого юзера
+  if (m.pinned_message) {
+    const tid = m.message_thread_id;
+    if (!tid) return;
+    const row = await env.BD.prepare('SELECT user_id FROM users WHERE topic_id = ?').bind(tid).first();
+    if (!row) return;
+    await ensureCustomName(env);
+    const pm = m.pinned_message;
+    const txt = (pm.text || pm.caption || '').trim();
+    if (txt && !txt.startsWith('//')) {
+      await env.BD.prepare(
+        'INSERT INTO pins (user_id, group_msg_id, text, created_at) VALUES (?, ?, ?, ?)'
+      ).bind(row.user_id, pm.message_id, txt, now()).run().catch(() => {});
+      const mp = await env.BD.prepare(
+        'SELECT user_msg_id AS u FROM messages WHERE user_id = ? AND group_msg_id = ?'
+      ).bind(row.user_id, pm.message_id).first();
+      if (mp?.u) {
+        await tg(env, 'pinChatMessage', { chat_id: row.user_id, message_id: mp.u }).catch(() => {});
       }
+      await tg(env, 'sendMessage', {
+        chat_id: m.chat.id,
+        message_thread_id: tid,
+        text: '📌 Добавлено в раздел «Закреп» у сотрудника.',
+        disable_notification: true,
+      });
     }
-    * { box-sizing: border-box; margin: 0; -webkit-tap-highlight-color: transparent; }
-    html { background: var(--page); height: 100%; }
-    body {
-      background: var(--page);
-      color: var(--tx);
-      font: 15px/1.3 -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
-      height: var(--tg-viewport-height, 100vh);
-      overflow: hidden;
-      padding: 8px 12px calc(env(safe-area-inset-bottom, 0px) + 14px);
-    }
-    #app { height: 100%; display: flex; flex-direction: column; gap: 10px; max-width: 480px; margin: 0 auto; }
-    button, select { font-family: inherit; cursor: pointer; }
-    svg.i { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+    return;
+  }
 
-    #stage { flex: 1; min-height: 0; display: flex; flex-direction: column; }
-    #body { flex: 1; min-height: 0; display: none; flex-direction: column; }
-    #list { flex: 1; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; padding-bottom: 4px; }
-    #list::-webkit-scrollbar { display: none; }
+  const text = m.text || '';
+  const cmd = /^\/(\w+)(?:@\w+)?(?:\s+([\s\S]*))?$/.exec(text);
+  if (cmd && (await onCommand(m, env, cmd[1].toLowerCase(), (cmd[2] || '').trim()))) return;
 
-    .hero {
-      flex: none;
-      position: relative;
-      border-radius: 34px;
-      padding: 18px 16px 16px;
-      background: linear-gradient(180deg, var(--tint), var(--panel) 75%);
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      gap: 18px;
-      box-shadow: 0 6px 20px rgba(0,0,0,.06);
-    }
-    .hero-top { display: flex; flex-direction: column; align-items: center; }
-    .hero .ib { position: absolute; top: 14px; right: 14px; }
-    .ib {
-      border: 0; background: var(--glass); color: var(--tx);
-      width: 42px; height: 42px; border-radius: 50%;
-      display: flex; align-items: center; justify-content: center; flex: none; transition: transform .12s;
-    }
-    .ib:active { transform: scale(.92); }
-    .av {
-      width: 80px; height: 80px; border-radius: 50%;
-      background: var(--ac); color: var(--act);
-      display: flex; align-items: center; justify-content: center;
-      font-weight: 600; font-size: 30px; flex: none; overflow: hidden;
-    }
-    .av.s { width: 44px; height: 44px; font-size: 18px; }
-    .av img { width: 100%; height: 100%; object-fit: cover; }
-    h1 { font-size: 23px; font-weight: 600; margin-top: 10px; text-align: center; letter-spacing: -.01em; }
-    .subl { color: var(--hint); font-size: 14px; margin-top: 2px; text-align: center; }
+  const tid = m.message_thread_id;
+  if (!tid) return;
+  if ((m.text || m.caption || '').startsWith('//')) return; // заметка для команды
 
-    .acts { display: flex; gap: 28px; }
-    .acts button, .acts span.off {
-      border: 0; background: none; padding: 0;
-      display: flex; flex-direction: column; align-items: center; gap: 6px;
-      color: var(--tx); font-size: 13px;
-    }
-    .acts .b {
-      width: 76px; height: 52px; border-radius: 26px;
-      background: var(--glass); color: var(--ac);
-      display: flex; align-items: center; justify-content: center; transition: transform .12s;
-    }
-    .acts button:active .b { transform: scale(.94); }
-    .acts .off { opacity: .4; }
+  const row = await env.BD.prepare('SELECT user_id FROM users WHERE topic_id = ?').bind(tid).first();
+  if (!row) return;
 
-    .bio { align-self: stretch; background: var(--glass); border-radius: 20px; padding: 12px 16px; }
-    .bio small { color: var(--hint); font-size: 13px; display: block; }
-    .bio p { margin-top: 3px; font-size: 15px; line-height: 1.35; word-break: break-word; }
-    .bio p+p { margin-top: 1px; }
-    .bio .none { color: var(--hint); }
+  let replyTo;
+  if (m.reply_to_message) {
+    const mp = await env.BD.prepare(
+      'SELECT user_msg_id AS u FROM messages WHERE user_id = ? AND group_msg_id = ?'
+    ).bind(row.user_id, m.reply_to_message.message_id).first();
+    replyTo = mp?.u;
+  }
 
-    .sh { flex: none; display: flex; align-items: center; justify-content: space-between; padding: 2px 4px 8px; min-height: 36px; }
-    .sec { font-weight: 700; font-size: 20px; }
-    .add { border: 0; background: var(--glass); color: var(--ac); font-weight: 600; font-size: 14px; border-radius: 14px; padding: 7px 14px; }
+  const r = await copy(env, m.chat.id, m.message_id, row.user_id, undefined, replyTo);
+  if (r.ok) {
+    await saveMap(env, row.user_id, r.result.message_id, m.message_id);
+  } else {
+    if (/blocked by the user|user is deactivated/i.test(r.description || '')) {
+      await env.BD.prepare('UPDATE users SET blocked_bot = 1 WHERE user_id = ?').bind(row.user_id).run().catch(() => {});
+    }
+    await tg(env, 'sendMessage', {
+      chat_id: m.chat.id,
+      message_thread_id: tid,
+      text: '⚠️ Не доставлено: ' + (r.description || 'ошибка'),
+    });
+  }
+}
 
-    .row {
-      display: flex; align-items: center; gap: 12px;
-      background: var(--panel); border-radius: var(--r);
-      padding: 10px 12px; margin-bottom: 8px; box-shadow: 0 2px 10px rgba(0,0,0,.04);
+// ---------- правки сообщений ----------
+async function onEdit(m, env) {
+  if (m.chat.type === 'private') {
+    const row = await env.BD.prepare(
+      `SELECT x.group_msg_id, u.topic_id, u.banned FROM messages x
+       JOIN users u ON u.user_id = x.user_id
+       WHERE x.user_id = ? AND x.user_msg_id = ?`
+    ).bind(m.from.id, m.message_id).first();
+    if (!row || row.banned) return;
+    const r = await mirrorEdit(env, m, env.GROUP_ID, row.group_msg_id);
+    if (r.ok) {
+      await tg(env, 'sendMessage', {
+        chat_id: env.GROUP_ID,
+        message_thread_id: row.topic_id,
+        reply_parameters: { message_id: row.group_msg_id, allow_sending_without_reply: true },
+        text: '✏️ Клиент изменил это сообщение',
+        disable_notification: true,
+      });
     }
-    .row.off { opacity: .55; }
-    .nm { flex: 1; min-width: 0; }
-    .nm b, .nm small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .nm small { color: var(--hint); }
-    .hide, .rn { border: 0; background: var(--glass); color: var(--ac); width: 36px; height: 36px; border-radius: 50%; display: flex; align-items: center; justify-content: center; flex: none; transition: transform .12s; }
-    .hide:active, .rn:active { transform: scale(.9); }
-    .hide svg.i, .rn svg.i { width: 19px; height: 19px; }
-    .del svg { pointer-events: none; }
-    .del svg.i { width: 18px; height: 18px; display: block; }
-    .item b span.del { display: flex; align-items: center; }
-    .empty { background: var(--panel); border-radius: var(--r); color: var(--hint); text-align: center; padding: 28px 14px; }
-    .txt { white-space: pre-wrap; margin-top: 4px; word-break: break-word; }
-    .item { background: var(--panel); border-radius: var(--r); padding: 12px 14px; margin-bottom: 8px; box-shadow: 0 2px 10px rgba(0,0,0,.04); }
-    .item b { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
-    .item b span.del { color: var(--hint); padding: 0 4px; cursor: pointer; }
-    .badge { display: inline-block; font-size: 12px; font-weight: 600; color: var(--ac); background: var(--glass); padding: 3px 9px; border-radius: 10px; }
+    return;
+  }
 
-    /* Панель навигации: радиусы вложены (30 → 24), отступы от скруглённых углов шторки iOS */
-    .dock { width: 100%; flex: none; padding: 0 2px; }
-    .nav {
-      width: 100%; display: flex; gap: 4px; padding: 6px;
-      border-radius: 32px; background: var(--panel);
-      box-shadow: 0 6px 20px rgba(0,0,0,.08);
+  if (String(m.chat.id) === String(env.GROUP_ID)) {
+    if (m.from?.is_bot && !m.sender_chat) return;
+    const row = await env.BD.prepare(
+      'SELECT user_id, user_msg_id FROM messages WHERE group_msg_id = ?'
+    ).bind(m.message_id).first();
+    if (!row) return;
+    const r = await mirrorEdit(env, m, row.user_id, row.user_msg_id);
+    if (!r.ok && !/not modified/i.test(r.description || '') && m.message_thread_id) {
+      await tg(env, 'sendMessage', {
+        chat_id: m.chat.id,
+        message_thread_id: m.message_thread_id,
+        text: '⚠️ Правку не удалось передать клиенту: ' + (r.description || 'ошибка'),
+      });
     }
-    @supports (backdrop-filter: blur(10px)) {
-      .nav {
-        background: color-mix(in srgb, var(--panel) 85%, transparent);
-        backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
-      }
-    }
-    .nav button {
-      flex: 1; min-width: 0; border: 0; background: none; color: var(--hint);
-      border-radius: 26px; padding: 9px 2px 8px;
-      display: flex; flex-direction: column; align-items: center; gap: 4px;
-      font-size: 11px; font-weight: 500; transition: background .15s, color .15s, box-shadow .15s;
-    }
-    .nav button.on {
-      background: var(--card); color: var(--ac);
-      box-shadow: 0 4px 12px rgba(0,0,0,.16), 0 1px 3px rgba(0,0,0,.10);
-    }
-    .nav svg.i { width: 24px; height: 24px; }
+  }
+}
 
-    .sub-wrap { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; padding-bottom: 6px; }
-    .sub-wrap::-webkit-scrollbar { display: none; }
-    .sub-head { display: flex; align-items: center; gap: 12px; padding: 2px 2px 0; flex: none; }
-    .stitle { font-size: 22px; font-weight: 700; }
-    .fcard {
-      border-radius: 30px; padding: 16px;
-      background: linear-gradient(180deg, var(--tint), var(--panel) 75%);
-      box-shadow: 0 6px 20px rgba(0,0,0,.06);
-      display: flex; flex-direction: column; gap: 10px; flex: none;
-    }
-    .fgrp { display: flex; flex-direction: column; gap: 4px; }
-    label { color: var(--hint); font-size: 13px; font-weight: 500; padding-left: 6px; }
-    input, textarea, select {
-      width: 100%; font: inherit; color: var(--tx); background: var(--glass);
-      border: 1.5px solid transparent; border-radius: 16px; padding: 11px 14px; outline: none;
-      transition: border-color .15s, background .15s;
-    }
-    input:focus, textarea:focus, select:focus { border-color: var(--ac); background: var(--card); }
-    .btn {
-      border: 0; font: inherit; font-weight: 600; background: var(--ac); color: var(--act);
-      border-radius: 18px; padding: 12px; width: 100%; transition: transform .12s;
-    }
-    .btn:active { transform: scale(.98); }
-    .btn.ghost { background: var(--glass); color: var(--ac); }
-  </style>
-</head>
-<body>
-  <div id="app"></div>
-  <script>
-    // Адрес вашего воркера на Cloudflare (без слэша в конце)
-    var API_BASE = 'https://support-bot-2.itsalexoncc.workers.dev';
+function inputMedia(m) {
+  const cap = { caption: m.caption, caption_entities: m.caption_entities };
+  if (m.photo) return { type: 'photo', media: m.photo[m.photo.length - 1].file_id, ...cap };
+  if (m.video) return { type: 'video', media: m.video.file_id, ...cap };
+  if (m.animation) return { type: 'animation', media: m.animation.file_id, ...cap };
+  if (m.audio) return { type: 'audio', media: m.audio.file_id, ...cap };
+  if (m.document) return { type: 'document', media: m.document.file_id, ...cap };
+  return null;
+}
 
-    var tg = window.Telegram && Telegram.WebApp,
-        app = document.getElementById('app'),
-        me = null,
-        cache = {},          // данные вкладок: грузятся один раз при запуске
-        photos = {},         // промисы фото
-        photoUrls = {},      // готовые ссылки на фото
-        back = null,
-        tab = 'home',
-        seq = 0;
+async function mirrorEdit(env, m, chat_id, message_id) {
+  if (m.text !== undefined) {
+    return tg(env, 'editMessageText', { chat_id, message_id, text: m.text, entities: m.entities });
+  }
+  const media = inputMedia(m);
+  if (media) {
+    const r = await tg(env, 'editMessageMedia', { chat_id, message_id, media });
+    if (r.ok || /not modified/i.test(r.description || '')) return r;
+  }
+  return tg(env, 'editMessageCaption', {
+    chat_id,
+    message_id,
+    caption: m.caption || '',
+    caption_entities: m.caption_entities,
+    show_caption_above_media: m.show_caption_above_media,
+  });
+}
 
-    var URLS = {
-      colleagues: '/api/colleagues',
-      pins: '/api/pins',
-      notifications: '/api/content/notifications'
+// ---------- команды (только админы группы) ----------
+async function isAdminId(env, userId) {
+  const r = await tg(env, 'getChatMember', { chat_id: env.GROUP_ID, user_id: userId });
+  return r.ok && ['creator', 'administrator'].includes(r.result.status);
+}
+
+async function onCommand(m, env, cmd, arg) {
+  const known = ['help', 'stats', 'ban', 'unban', 'broadcast', 'settings', 'setwelcome', 'setautoreply', 'setwork'];
+  if (!known.includes(cmd)) return false; // неизвестная команда: пересылаем как обычное сообщение
+
+  const say = (text, extra = {}) =>
+    tg(env, 'sendMessage', {
+      chat_id: m.chat.id,
+      message_thread_id: m.message_thread_id,
+      text,
+      parse_mode: 'HTML',
+      ...extra,
+    });
+
+  const admin =
+    (m.sender_chat && String(m.sender_chat.id) === String(env.GROUP_ID)) ||
+    (await isAdminId(env, m.from.id));
+  if (!admin) {
+    await say('Команды доступны только администраторам группы.');
+    return true;
+  }
+
+  if (cmd === 'help') {
+    await say(
+      '<b>Команды (для админов)</b>\n' +
+      '/ban и /unban: в топике клиента (или /ban ID)\n' +
+      '/stats: статистика\n' +
+      '/broadcast: в General ответом на сообщение, которое нужно разослать всем\n' +
+      '/settings: текущие настройки\n' +
+      '/setwelcome текст: приветствие на /start (reset сбросит)\n' +
+      '/setautoreply текст: автоответ вне рабочего времени (reset сбросит)\n' +
+      '/setwork 10-19 1-5: рабочие часы и дни недели (off отключает)\n\n' +
+      'Сообщение, начинающееся с //, клиенту не отправляется.'
+    );
+    return true;
+  }
+
+  if (cmd === 'ban' || cmd === 'unban') {
+    let uid = Number(arg) || null;
+    if (!uid && m.message_thread_id) {
+      const r = await env.BD.prepare('SELECT user_id FROM users WHERE topic_id = ?').bind(m.message_thread_id).first();
+      uid = r?.user_id;
+    }
+    if (!uid) {
+      await say('Выполните команду в топике клиента или укажите ID: /ban 123456789');
+      return true;
+    }
+    const val = cmd === 'ban' ? 1 : 0;
+    const res = await env.BD.prepare('UPDATE users SET banned = ? WHERE user_id = ?').bind(val, uid).run();
+    if (!res.meta.changes) await say('Клиент с таким ID не найден в базе.');
+    else await say(val ? '🚫 Клиент заблокирован: его сообщения больше не пересылаются.' : '✅ Клиент разблокирован.');
+    return true;
+  }
+
+  if (cmd === 'stats') {
+    const q = (sql, ...b) => env.BD.prepare(sql).bind(...b).first();
+    const t = now();
+    const total = (await q('SELECT COUNT(*) AS c FROM users')).c;
+    const banned = (await q('SELECT COUNT(*) AS c FROM users WHERE banned = 1')).c;
+    const d1 = (await q('SELECT COUNT(*) AS c FROM users WHERE last_msg_at >= ?', t - 86400)).c;
+    const d7 = (await q('SELECT COUNT(*) AS c FROM users WHERE last_msg_at >= ?', t - 7 * 86400)).c;
+    await say(
+      `<b>Статистика</b>\nВсего клиентов: ${total}\nЗаблокировано: ${banned}\n` +
+      `Писали за 24 часа: ${d1}\nПисали за 7 дней: ${d7}`
+    );
+    return true;
+  }
+
+  if (cmd === 'settings') {
+    const w = (await getSetting(env, 'welcome')) || env.WELCOME || '(стандартное)';
+    const a = (await getSetting(env, 'autoreply')) || env.AUTOREPLY || '(не задан)';
+    const h = await getSetting(env, 'work_hours');
+    const d = (await getSetting(env, 'work_days')) || '1-7';
+    await say(
+      `<b>Настройки</b>\nПриветствие: ${esc(w)}\nАвтоответ: ${esc(a)}\n` +
+      `Рабочее время: ${h ? `${esc(h)} ч, дни ${esc(d)}` : 'не задано (автоответ выключен)'}\n` +
+      `Часовой пояс: UTC+${Number(env.TZ_OFFSET ?? 3)}`
+    );
+    return true;
+  }
+
+  if (cmd === 'setwelcome' || cmd === 'setautoreply') {
+    const key = cmd === 'setwelcome' ? 'welcome' : 'autoreply';
+    if (!arg) await say(`Укажите текст после команды, например:\n/${cmd} Здравствуйте!\nСбросить: /${cmd} reset`);
+    else if (arg === 'reset') { await delSetting(env, key); await say('Сброшено.'); }
+    else { await setSetting(env, key, arg); await say('✅ Сохранено.'); }
+    return true;
+  }
+
+  if (cmd === 'setwork') {
+    if (arg === 'off') {
+      await delSetting(env, 'work_hours');
+      await delSetting(env, 'work_days');
+      await say('Рабочее время отключено, автоответ не отправляется.');
+      return true;
+    }
+    const mm = /^(\d{1,2})-(\d{1,2})(?:\s+([1-7])-([1-7]))?$/.exec(arg);
+    if (!mm || Number(mm[1]) > 24 || Number(mm[2]) > 24) {
+      await say('Формат: /setwork 10-19 1-5\n(часы работы, затем дни недели от 1=пн до 7=вс; дни можно не указывать)');
+      return true;
+    }
+    await setSetting(env, 'work_hours', `${mm[1]}-${mm[2]}`);
+    await setSetting(env, 'work_days', mm[3] ? `${mm[3]}-${mm[4]}` : '1-7');
+    await say('✅ Рабочее время сохранено. Вне его клиенты получают автоответ (если он задан через /setautoreply).');
+    return true;
+  }
+
+  if (cmd === 'broadcast') {
+    if (m.message_thread_id) {
+      await say('Запускайте рассылку в общей теме General.');
+      return true;
+    }
+    const src = m.reply_to_message;
+    if (!src || src.forum_topic_created || src.from?.id === undefined) {
+      await say('Ответьте командой /broadcast на сообщение, которое нужно разослать.');
+      return true;
+    }
+    const n = (await env.BD.prepare('SELECT COUNT(*) AS c FROM users WHERE banned = 0').first()).c;
+    const ins = await env.BD.prepare(
+      "INSERT INTO broadcasts (from_chat, msg_id, status, notify_chat) VALUES (?, ?, 'pending', ?)"
+    ).bind(m.chat.id, src.message_id, m.chat.id).run();
+    const id = ins.meta.last_row_id;
+    await say(`Разослать это сообщение <b>${n}</b> клиентам?`, {
+      reply_markup: {
+        inline_keyboard: [[
+          { text: '✅ Отправить', callback_data: `bc_go:${id}` },
+          { text: '✖️ Отмена', callback_data: `bc_no:${id}` },
+        ]],
+      },
+    });
+    return true;
+  }
+
+  return false;
+}
+
+async function onCallback(q, env) {
+  const [act, idStr] = (q.data || '').split(':');
+  if (act !== 'bc_go' && act !== 'bc_no') return;
+  if (String(q.message?.chat?.id) !== String(env.GROUP_ID)) return;
+
+  if (!(await isAdminId(env, q.from.id))) {
+    await tg(env, 'answerCallbackQuery', { callback_query_id: q.id, text: 'Только для админов', show_alert: true });
+    return;
+  }
+  const b = await env.BD.prepare("SELECT id FROM broadcasts WHERE id = ? AND status = 'pending'")
+    .bind(Number(idStr)).first();
+  if (!b) {
+    await tg(env, 'answerCallbackQuery', { callback_query_id: q.id, text: 'Уже обработано' });
+    return;
+  }
+  const status = act === 'bc_go' ? 'running' : 'cancelled';
+  await env.BD.prepare('UPDATE broadcasts SET status = ? WHERE id = ?').bind(status, b.id).run();
+  await tg(env, 'answerCallbackQuery', { callback_query_id: q.id });
+  await tg(env, 'editMessageText', {
+    chat_id: q.message.chat.id,
+    message_id: q.message.message_id,
+    text:
+      act === 'bc_go'
+        ? `🚀 Рассылка запущена. Отправка идёт порциями (около ${BATCH} сообщений в минуту), по завершении напишу итог здесь.`
+        : 'Рассылка отменена.',
+  });
+}
+
+// ---------- рассылка (вызывается по cron раз в минуту) ----------
+async function tickBroadcast(env) {
+  const b = await env.BD.prepare("SELECT * FROM broadcasts WHERE status = 'running' ORDER BY id LIMIT 1").first();
+  if (!b) return;
+  const { results } = await env.BD.prepare(
+    'SELECT user_id FROM users WHERE banned = 0 AND user_id > ? ORDER BY user_id LIMIT ?'
+  ).bind(b.cursor, BATCH).all();
+
+  let sent = 0, failed = 0, cursor = b.cursor, stopped = false;
+  for (const u of results) {
+    const r = await copy(env, b.from_chat, b.msg_id, u.user_id);
+    if (r.ok) sent++;
+    else if (r.error_code === 429) { stopped = true; break; } // Telegram просит подождать
+    else failed++;
+    cursor = u.user_id;
+  }
+  const done = !stopped && results.length < BATCH;
+  await env.BD.prepare(
+    'UPDATE broadcasts SET cursor = ?, sent = sent + ?, failed = failed + ?, status = ? WHERE id = ?'
+  ).bind(cursor, sent, failed, done ? 'done' : 'running', b.id).run();
+
+  if (done) {
+    await tg(env, 'sendMessage', {
+      chat_id: b.notify_chat,
+      text: `📣 Рассылка завершена. Доставлено: ${b.sent + sent}, не доставлено: ${b.failed + failed} (клиент заблокировал бота или удалил аккаунт).`,
+    });
+  }
+}
+
+// ---------- вспомогательное ----------
+function copy(env, fromChat, msgId, toChat, threadId, replyTo) {
+  const body = { chat_id: toChat, from_chat_id: fromChat, message_id: msgId };
+  if (threadId) body.message_thread_id = threadId;
+  if (replyTo) body.reply_parameters = { message_id: replyTo, allow_sending_without_reply: true };
+  return tg(env, 'copyMessage', body);
+}
+
+async function saveMap(env, userId, userMsgId, groupMsgId) {
+  await env.BD.prepare(
+    'INSERT OR REPLACE INTO messages (user_id, user_msg_id, group_msg_id, created_at) VALUES (?, ?, ?, ?)'
+  ).bind(userId, userMsgId, groupMsgId, now()).run();
+  if (Math.random() < 0.02) {
+    // правки в Telegram возможны около 2 суток, храним 3
+    await env.BD.prepare('DELETE FROM messages WHERE created_at < ?').bind(now() - 3 * 86400).run();
+  }
+}
+
+// =====================  MINI APP: API  =====================
+
+// Пользователь заблокировал/разблокировал бота (личный чат: chat.id = user_id)
+async function onMyChatMember(ev, env) {
+  if (ev.chat.type !== 'private') return;
+  const status = ev.new_chat_member?.status;
+  if (status !== 'kicked' && status !== 'member') return;
+  await env.BD.prepare('UPDATE users SET blocked_bot = ? WHERE user_id = ?')
+    .bind(status === 'kicked' ? 1 : 0, ev.chat.id).run();
+}
+
+// ADMIN_USER_ID: один ID или несколько через запятую, например 123456789,987654321
+const adminIds = (env) => String(env.ADMIN_USER_ID || '').split(/[,;\s]+/).map(Number).filter(Boolean);
+const isAdminUser = (env, id) => adminIds(env).includes(Number(id));
+
+// Запрет ссылок на Telegram в текстах, которые правит владелец (защита анонимности)
+const LEAK = /t\.me|telegram\.me|tg:\/\/|(^|\s)@[A-Za-z]\w{3,}/i;
+
+// Колонки и таблица pins создаются сами при первом обращении (ошибки игнорируются)
+let customNameReady;
+function ensureCustomName(env) {
+  customNameReady ||= (async () => {
+    for (const col of ['custom_name', 'custom_username']) {
+      await DB(env).prepare('ALTER TABLE users ADD COLUMN ' + col + ' TEXT').run().catch(() => {});
+    }
+    await DB(env).prepare(
+      'CREATE TABLE IF NOT EXISTS pins (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, group_msg_id INTEGER, text TEXT NOT NULL, created_at INTEGER)'
+    ).run().catch(() => {});
+  })();
+  return customNameReady;
+}
+
+async function getContent(env, kind) {
+  try { const v = JSON.parse((await getSetting(env, kind)) || '[]'); return Array.isArray(v) ? v : []; } catch { return []; }
+}
+
+let botNameCache;
+async function botName(env) {
+  if (!botNameCache) {
+    const r = await tg(env, 'getMe', {});
+    botNameCache = r.ok ? r.result.first_name : 'Бот';
+  }
+  return botNameCache;
+}
+
+// Создаёт недостающие колонки и таблицы (ошибки «уже существует» безвредны)
+async function ensureSchema(env) {
+  const out = {};
+  const run = async (name, sql) => {
+    try { await env.BD.prepare(sql).run(); out[name] = 'ok'; }
+    catch (e) { out[name] = String(e.message || e).slice(0, 80); }
+  };
+  await run('first_name', 'ALTER TABLE users ADD COLUMN first_name TEXT');
+  await run('last_name', 'ALTER TABLE users ADD COLUMN last_name TEXT');
+  await run('username', 'ALTER TABLE users ADD COLUMN username TEXT');
+  await run('hidden', 'ALTER TABLE users ADD COLUMN hidden INTEGER DEFAULT 0');
+  await run('blocked_bot', 'ALTER TABLE users ADD COLUMN blocked_bot INTEGER DEFAULT 0');
+  await run('custom_name', 'ALTER TABLE users ADD COLUMN custom_name TEXT');
+  await run('custom_username', 'ALTER TABLE users ADD COLUMN custom_username TEXT');
+  await run('pins', 'CREATE TABLE IF NOT EXISTS pins (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, group_msg_id INTEGER, text TEXT NOT NULL, created_at INTEGER)');
+  return out;
+}
+
+const enc = new TextEncoder();
+const DB = (env) => env.BD;
+
+const DEFAULT_HEADER = {
+  title: 'Работник склада',
+  company: 'ООО «Смарт Деним»',
+  phone: '+79883685548',
+  email: 's.nesterov101@yandex.ru',
+};
+
+// ---------- крипто ----------
+const hex = (buf) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+
+async function hmac(key, data) {
+  const k = await crypto.subtle.importKey(
+    'raw', typeof key === 'string' ? enc.encode(key) : key,
+    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  return crypto.subtle.sign('HMAC', k, enc.encode(data));
+}
+
+function safeEqual(a, b) {
+  if (a.length !== b.length) return false;
+  let r = 0;
+  for (let i = 0; i < a.length; i++) r |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return r === 0;
+}
+
+// Проверка подписи Telegram initData. Возвращает объект user или null.
+async function verifyInitData(initData, botToken, maxAgeSec = 86400) {
+  const p = new URLSearchParams(initData);
+  const hash = p.get('hash');
+  if (!hash) return null;
+  p.delete('hash');
+  const checkString = [...p.entries()]
+    .sort(([a], [b]) => (a < b ? -1 : 1))
+    .map(([k, v]) => `${k}=${v}`)
+    .join('\n');
+  const secret = await hmac('WebAppData', botToken);
+  const sig = hex(await hmac(secret, checkString));
+  if (!safeEqual(sig, hash)) return null;
+  const age = Date.now() / 1000 - Number(p.get('auth_date'));
+  if (!(age >= 0 && age < maxAgeSec)) return null;
+  try { return JSON.parse(p.get('user')); } catch { return null; }
+}
+
+// Непрозрачный идентификатор коллеги: Telegram ID наружу не уходит.
+async function refFor(userId, env) {
+  return hex(await hmac('ref:' + env.BOT_TOKEN, String(userId))).slice(0, 16);
+}
+
+async function resolveRef(ref, env) {
+  const { results } = await DB(env)
+    .prepare('SELECT user_id FROM users WHERE topic_id IS NOT NULL').all();
+  for (const r of results) {
+    if (safeEqual(await refFor(r.user_id, env), ref)) return r.user_id;
+  }
+  return null;
+}
+
+// ---------- ответы ----------
+const json = (data, status = 200) =>
+  new Response(JSON.stringify(data), {
+    status,
+    headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+  });
+
+// ---------- данные ----------
+async function getHeader(env) {
+  const row = await DB(env).prepare("SELECT value FROM settings WHERE key = 'header'").first();
+  if (!row) return DEFAULT_HEADER;
+  try { return { ...DEFAULT_HEADER, ...JSON.parse(row.value) }; } catch { return DEFAULT_HEADER; }
+}
+
+function validateHeader(h) {
+  const text = (s, max) => typeof s === 'string' && s.trim().length > 0 && s.length <= max;
+  const leak = LEAK;
+  if (!text(h.title, 60) || !text(h.company, 60)) return 'Некорректное название или компания';
+  if (leak.test(h.title) || leak.test(h.company)) return 'Нельзя указывать ссылки на Telegram';
+  if (!/^\+?[0-9]{10,15}$/.test(h.phone || '')) return 'Некорректный телефон';
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(h.email || '')) return 'Некорректная почта';
+  return null;
+}
+
+// Список коллег (без звёздочек избранного и без данных владельца)
+async function listColleagues(env, viewerId) {
+  const admins = JSON.stringify(adminIds(env));
+  const isAdm = isAdminUser(env, viewerId);
+  const sql = `SELECT user_id, first_name, last_name, name, username, hidden, blocked_bot, custom_name, custom_username
+                 FROM users
+                WHERE topic_id IS NOT NULL AND user_id != ?1 AND user_id NOT IN (SELECT value FROM json_each(?2))
+                  AND COALESCE(banned,0) = 0
+                  AND (?3 = 1 OR (COALESCE(hidden,0) = 0 AND COALESCE(blocked_bot,0) = 0))
+                ORDER BY COALESCE(first_name, name) COLLATE NOCASE`;
+  const { results } = await DB(env).prepare(sql).bind(viewerId, admins, isAdm ? 1 : 0).all();
+
+  return Promise.all(results.map(async (u) => {
+    const first = u.first_name || u.name || 'Без имени';
+    return {
+      ref: await refFor(u.user_id, env),
+      name: u.custom_name || [first, u.last_name].filter(Boolean).join(' '),
+      initial: (u.custom_name || first).trim().charAt(0).toUpperCase(),
+      username: u.custom_username || u.username || null,
+      ...(isAdm ? { hidden: !!u.hidden, blocked: !!u.blocked_bot } : {}),
     };
+  }));
+}
 
-    function esc(s) {
-      return String(s == null ? '' : s).replace(/[&<>"]/g, function(c) {
-        return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];
-      });
+// Список закреплённых сообщений для каждого юзера
+async function listPins(env, viewerId, isAdm) {
+  if (isAdm) {
+    const { results } = await DB(env).prepare(
+      `SELECT p.id, p.user_id, p.text, p.created_at, u.first_name, u.last_name, u.name, u.custom_name
+         FROM pins p LEFT JOIN users u ON u.user_id = p.user_id
+        ORDER BY p.id DESC LIMIT 100`
+    ).all();
+    return results.map((r) => {
+      const first = r.first_name || r.name || 'Сотрудник';
+      const who = r.user_id === 0 ? 'Всем сотрудникам' : (r.custom_name || [first, r.last_name].filter(Boolean).join(' '));
+      return { id: r.id, text: r.text, who };
+    });
+  }
+  const { results } = await DB(env).prepare(
+    'SELECT id, text, created_at FROM pins WHERE user_id = ? OR user_id = 0 ORDER BY id DESC LIMIT 50'
+  ).bind(viewerId).all();
+  return results.map((r) => ({ id: r.id, text: r.text }));
+}
+
+async function photoResponse(env, userId) {
+  const api = `https://api.telegram.org/bot${env.BOT_TOKEN}`;
+  const photos = await (await fetch(`${api}/getUserProfilePhotos?user_id=${userId}&limit=1`)).json();
+  const sizes = photos.ok && photos.result.photos[0];
+  if (!sizes) return new Response(null, { status: 404 });
+  const small = sizes[Math.min(1, sizes.length - 1)]; // средний размер
+  const file = await (await fetch(`${api}/getFile?file_id=${small.file_id}`)).json();
+  if (!file.ok) return new Response(null, { status: 404 });
+  const img = await fetch(`https://api.telegram.org/file/bot${env.BOT_TOKEN}/${file.result.file_path}`);
+  return new Response(img.body, {
+    headers: { 'Content-Type': 'image/jpeg', 'Cache-Control': 'private, max-age=3600' },
+  });
+}
+
+// ---------- роутер ----------
+async function handleApi(request, env) {
+  const url = new URL(request.url);
+  const path = url.pathname;
+
+  // 1. Аутентификация: заголовок "Authorization: tma <initData>"
+  const auth = request.headers.get('Authorization') || '';
+  if (!auth.startsWith('tma ')) return json({ error: 'unauthorized' }, 401);
+  const tgUser = await verifyInitData(auth.slice(4), env.BOT_TOKEN);
+  if (!tgUser) return json({ error: 'unauthorized' }, 401);
+
+  const me = Number(tgUser.id);
+  const isAdmin = isAdminUser(env, me);
+
+  // 2. Доступ только сотрудникам, которые есть в базе и не заблокированы
+  const row = await DB(env).prepare('SELECT banned FROM users WHERE user_id = ?').bind(me).first();
+  if (!isAdmin && (!row || row.banned)) return json({ error: 'forbidden' }, 403);
+
+  await ensureCustomName(env);
+  if (row) {
+    await DB(env).prepare('UPDATE users SET first_name = ?, last_name = ?, username = ? WHERE user_id = ?')
+      .bind(tgUser.first_name || null, tgUser.last_name || null, tgUser.username || null, me).run().catch(() => {});
+  }
+
+  try {
+    if (path === '/api/me' && request.method === 'GET') {
+      return json({ isAdmin, header: await getHeader(env), bot: await botName(env) });
     }
-    function $(id) { return document.getElementById(id); }
 
-    function api(p, o) {
-      o = o || {};
-      o.headers = {'Authorization': 'tma ' + tg.initData, 'Content-Type': 'application/json'};
-      return fetch(API_BASE + p, o).then(function(r) {
-        if (r.ok) return r;
-        return r.text().then(function(t) {
-          var e = new Error('http');
-          e.status = r.status;
-          try { e.msg = JSON.parse(t).error; } catch(_) {}
-          throw e;
-        });
-      });
-    }
-    function j(p, o) { return api(p, o).then(function(r) { return r.json(); }); }
-    function msg(t) { tg.showAlert ? tg.showAlert(t) : alert(t); }
-
-    // Кэш: повторный запрос идёт в сеть только при force
-    function getData(key, force) {
-      if (!force && cache[key]) return Promise.resolve(cache[key]);
-      return j(URLS[key]).then(function(d) { return (cache[key] = d.items); });
+    if (path === '/api/colleagues' && request.method === 'GET') {
+      return json({ items: await listColleagues(env, me) });
     }
 
-    function fail(e) {
-      app.innerHTML = '<div class="empty">' + (e && e.status === 403 ? 'Нет доступа.<br>Сначала напишите боту любое сообщение.' : 'Не удалось загрузить. Закройте и откройте снова.') + '</div>';
-    }
-
-    function av(ref, ch, cls) {
-      var inner = photoUrls[ref] ? '<img src="' + photoUrls[ref] + '" alt="">' : esc(ch);
-      return '<div class="av' + (cls ? ' ' + cls : '') + '" data-ref="' + esc(ref) + '">' + inner + '</div>';
-    }
-
-    function photoLoad(r) {
-      if (!photos[r]) {
-        photos[r] = api('/api/photo/' + r)
-          .then(function(x) { return x.blob(); })
-          .then(function(b) { return (photoUrls[r] = URL.createObjectURL(b)); })
-          .catch(function() { return null; });
+    if (path === '/api/pins') {
+      if (request.method === 'GET') {
+        return json({ items: await listPins(env, me, isAdmin) });
       }
-      return photos[r];
-    }
-
-    function photosLoad() {
-      [].forEach.call(app.querySelectorAll('.av[data-ref]'), function(el) {
-        var r = el.getAttribute('data-ref');
-        if (photoUrls[r]) return;
-        photoLoad(r).then(function(u) { if (u && el.isConnected) el.innerHTML = '<img src="' + u + '" alt="">'; });
-      });
-    }
-
-    function hex2rgb(s) {
-      s = (s || '').replace('#', '');
-      if (s.length === 3) s = s.replace(/./g, '$&$&');
-      return s.length === 6 ? [0, 2, 4].map(function(i) { return parseInt(s.substr(i, 2), 16); }) : null;
-    }
-    function mix(a, b, p) {
-      return '#' + a.map(function(v, i) {
-        var x = Math.round(v * p + b[i] * (1 - p));
-        return (x < 16 ? '0' : '') + x.toString(16);
-      }).join('');
-    }
-
-    function applyTheme() {
-      var t = tg.themeParams || {}, ac = hex2rgb(t.button_color), bg = hex2rgb(t.bg_color);
-      if (!ac || !bg) return;
-      var s = document.documentElement.style, page = mix(ac, bg, .22);
-      s.setProperty('--page', page);
-      s.setProperty('--panel', mix(ac, bg, .12));
-      s.setProperty('--tint', mix(ac, bg, .32));
-      try { tg.setBackgroundColor(page); } catch(e) {}
-      try { tg.setHeaderColor(page); } catch(e) {}
-      try { if (tg.setBottomBarColor) tg.setBottomBarColor(page); } catch(e) {}
-    }
-
-    function setBack(on) {
-      if (!tg.BackButton) return;
-      if (back) tg.BackButton.offClick(back);
-      if (on) { back = shell; tg.BackButton.onClick(back); tg.BackButton.show(); }
-      else tg.BackButton.hide();
-    }
-
-    var IC = {
-      tel: '<path d="M22 16.9v3a2 2 0 01-2.2 2 19.8 19.8 0 01-8.6-3.1 19.5 19.5 0 01-6-6A19.8 19.8 0 012.1 4.2 2 2 0 014.1 2h3a2 2 0 012 1.7c.1 1 .4 1.9.7 2.8a2 2 0 01-.5 2.1L8.1 9.9a16 16 0 006 6l1.3-1.3a2 2 0 012.1-.4c.9.3 1.8.6 2.8.7a2 2 0 011.7 2z"/>',
-      mail: '<rect x="3" y="5" width="18" height="14" rx="2.5"/><path d="M3.5 7l8.5 6 8.5-6"/>',
-      edit: '<path d="M4 20l1-4L16 5l3 3L8 19l-4 1z"/><path d="M14 7l3 3"/>',
-      back: '<path d="M15 18l-6-6 6-6"/>',
-      close: '<path d="M6 6l12 12M18 6L6 18"/>',
-      eye: '<path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z"/><circle cx="12" cy="12" r="2.8"/>',
-      eyeoff: '<path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z"/><circle cx="12" cy="12" r="2.8"/><path d="M4 4l16 16"/>',
-      home: '<path d="M4 11l8-7 8 7"/><path d="M6.5 9.5V19.5h11V9.5"/>',
-      pins: '<path d="M9 4h6l-1 6 3 3H7l3-3-1-6z"/><path d="M12 13v7"/>',
-      colleagues: '<circle cx="9.5" cy="9" r="3"/><path d="M4 19c.5-3 2.8-4.5 5.5-4.5s5 1.5 5.5 4.5"/><path d="M16 6.2a3 3 0 010 5.6M18 14.8c1.6.6 2.6 1.9 3 4.2"/>',
-      notifications: '<path d="M7 17v-6a5 5 0 0110 0v6"/><path d="M5 17h14"/><path d="M10.5 20.5h3"/>'
-    };
-    function ico(k) { return '<svg class="i" viewBox="0 0 24 24">' + IC[k] + '</svg>'; }
-
-    var TABS = [['home', 'Главная'], ['pins', 'Закреп'], ['colleagues', 'Коллектив'], ['notifications', 'Уведомления']];
-
-    function copyText(v) {
-      var ok = false;
-      try {
-        var t = document.createElement('textarea');
-        t.value = v; t.style.cssText = 'position:fixed;opacity:0';
-        document.body.appendChild(t); t.focus(); t.select();
-        ok = document.execCommand('copy');
-        document.body.removeChild(t);
-      } catch(e) {}
-      if (ok) msg('Скопировано');
-      else if (navigator.clipboard) navigator.clipboard.writeText(v).then(function() { msg('Скопировано'); }, function() { msg(v); });
-      else msg(v);
-    }
-
-    function contact(kind, val) {
-      var url = (kind === 'tel' ? 'tel:' : 'mailto:') + val,
-          go = kind === 'tel' ? 'Позвонить' : 'Написать письмо',
-          cp = kind === 'tel' ? 'Скопировать номер' : 'Скопировать адрес';
-      function act(id) {
-        if (id === 'go') { try { tg.openLink(url); } catch(e) { location.href = url; } }
-        else if (id === 'cp') copyText(val);
-      }
-      if (tg.showPopup) {
-        tg.showPopup({
-          title: val, message: 'Что сделать?',
-          buttons: [{id: 'go', type: 'default', text: go}, {id: 'cp', type: 'default', text: cp}, {type: 'cancel'}]
-        }, act);
-      } else if (confirm(go + '?')) act('go');
-    }
-
-    function act(kind, val, label) {
-      if (!val) return '<span class="off"><span class="b">' + ico(kind) + '</span>' + label + '</span>';
-      return '<button type="button" data-c="' + kind + '" data-v="' + esc(val) + '"><span class="b">' + ico(kind) + '</span>' + label + '</button>';
-    }
-
-    function shell() {
-      setBack(false);
-      var h = me.header;
-      app.innerHTML =
-        '<div id="stage">' +
-          '<div class="hero" id="hero">' +
-            (me.isAdmin ? '<button class="ib" id="ed" aria-label="Редактировать">' + ico('edit') + '</button>' : '') +
-            '<div class="hero-top">' +
-              av('bot', (me.bot || 'Б').charAt(0).toUpperCase()) +
-              '<h1>' + esc(me.bot) + '</h1>' +
-              '<div class="subl">Центр управления общением</div>' +
-            '</div>' +
-            '<div class="acts">' + act('tel', h.phone, 'Позвонить') + act('mail', h.email, 'Написать') + '</div>' +
-            '<div class="bio"><small>Информация</small>' +
-              ((h.title || h.company)
-                ? (h.title ? '<p><b>' + esc(h.title) + '</b></p>' : '') + (h.company ? '<p>' + esc(h.company) + '</p>' : '')
-                : '<p class="none">Не заполнено</p>') +
-            '</div>' +
-          '</div>' +
-          '<div id="body"></div>' +
-        '</div>' +
-        '<div class="dock"><nav class="nav">' +
-          TABS.map(function(t) { return '<button data-tab="' + t[0] + '">' + ico(t[0]) + t[1] + '</button>'; }).join('') +
-        '</nav></div>';
-
-      photosLoad();
-      app.onclick = function(e) {
-        var t = e.target.closest('[data-tab]');
-        if (t) { tab = t.getAttribute('data-tab'); showTab(); return; }
-        var c = e.target.closest('[data-c]');
-        if (c) { contact(c.getAttribute('data-c'), c.getAttribute('data-v')); return; }
-        if (e.target.closest('#ed')) editHeader();
-      };
-      showTab();
-    }
-
-    function showTab() {
-      seq++;
-      var my = seq;
-      [].forEach.call(app.querySelectorAll('.nav button'), function(b) {
-        b.classList.toggle('on', b.getAttribute('data-tab') === tab);
-      });
-      var hero = $('hero'), body = $('body');
-      if (tab === 'home') {
-        hero.style.display = 'flex';
-        body.style.display = 'none';
-        body.innerHTML = '';
-        return;
-      }
-      hero.style.display = 'none';
-      body.style.display = 'flex';
-      var title = TABS.filter(function(t) { return t[0] === tab; })[0][1],
-          canAdd = (tab === 'notifications' || tab === 'pins') && me.isAdmin;
-      body.innerHTML =
-        '<div class="sh"><div class="sec">' + title + '</div>' +
-        (canAdd ? '<button class="add" id="add">Добавить</button>' : '') +
-        '</div><div id="list"></div>';
-      if (tab === 'pins') pinsView(my);
-      else if (tab === 'notifications') content(tab, my);
-      else people(tab, my);
-    }
-
-    // Рисует список сразу из кэша; спиннер только если кэша нет (ошибка первой загрузки)
-    function withData(key, my, draw) {
-      var list = $('list');
-      if (cache[key]) return draw(cache[key]);
-      list.innerHTML = '<div class="empty">Загрузка…</div>';
-      getData(key).then(function(items) { if (my === seq) draw(items); })
-        .catch(function() { if (my === seq) list.innerHTML = '<div class="empty">Не удалось загрузить.</div>'; });
-    }
-
-    function pinsView(my) {
-      var list = $('list');
-      function draw() {
-        var items = cache.pins || [];
-        if (!items.length) { list.innerHTML = '<div class="empty">Закреплённых сообщений пока нет.</div>'; return; }
-        list.innerHTML = items.map(function(p) {
-          return '<div class="item"><b>' +
-              '<span>' + (p.who ? '<span class="badge">' + esc(p.who) + '</span>' : '📌 Важное') + '</span>' +
-              '<span class="del" data-dp="' + p.id + '">' + ico('close') + '</span>' +
-            '</b><div class="txt">' + esc(p.text) + '</div></div>';
-        }).join('');
-      }
-      list.onclick = function(e) {
-        var dp = e.target.getAttribute('data-dp');
-        if (!dp) return;
-        tg.showConfirm('Убрать сообщение из закрепа?', function(ok) {
-          if (!ok) return;
-          api('/api/pins?id=' + dp, {method: 'DELETE'}).then(function() {
-            cache.pins = cache.pins.filter(function(p) { return String(p.id) !== dp; });
-            if (my === seq) draw();
-          }).catch(function() { msg('Не удалось удалить'); });
-        });
-      };
-      withData('pins', my, draw);
-
-      var add = $('add');
-      if (add) add.onclick = function() {
-        getData('colleagues').then(function(users) {
-          var opts = '<option value="all">Всем сотрудникам</option>' +
-            users.map(function(u) { return '<option value="' + esc(u.ref) + '">' + esc(u.name) + '</option>'; }).join('');
-          sub('Новый закреп',
-            '<div class="fgrp"><label>Кому закрепить</label><select id="pr">' + opts + '</select></div>' +
-            '<div class="fgrp"><label>Текст сообщения</label><textarea id="px" rows="4" maxlength="1000" placeholder="Введите текст закрепа"></textarea></div>' +
-            '<button class="btn" id="ok">Закрепить</button>'
-          );
-          $('ok').onclick = function() {
-            var ref = $('pr').value, txt = $('px').value.trim();
-            if (!txt) return msg('Введите текст сообщения');
-            j('/api/pins', {method: 'POST', body: JSON.stringify({ref: ref, text: txt})})
-              .then(function() { return getData('pins', true); })
-              .then(shell)
-              .catch(function() { msg('Не удалось сохранить'); });
-          };
-        }).catch(function() { msg('Не удалось загрузить список сотрудников'); });
-      };
-    }
-
-    function people(kind, my) {
-      var list = $('list');
-      function draw(items) {
-        if (!items.length) { list.innerHTML = '<div class="empty">Список пуст.</div>'; return; }
-        list.innerHTML = items.map(function(u) {
-          var adm = me.isAdmin, st = u.blocked ? 'заблокировал бота' : (u.hidden ? 'скрыт' : '');
-          return '<div class="row' + (u.hidden || u.blocked ? ' off' : '') + '" data-u="' + esc(u.username || '') + '" data-r="' + esc(u.ref) + '" data-n="' + esc(u.name) + '">' +
-            av(u.ref, u.initial, 's') +
-            '<div class="nm"><b>' + esc(u.name) + '</b>' +
-              (u.username ? '<small>@' + esc(u.username) + '</small>' : '') +
-              (adm && st ? '<small class="st">' + st + '</small>' : '') +
-            '</div>' +
-            (adm ? '<button class="rn" aria-label="Изменить">' + ico('edit') + '</button>' : '') +
-            (adm ? '<button class="hide" aria-label="Скрыть" data-h="' + (u.hidden ? 1 : 0) + '">' + ico(u.hidden ? 'eyeoff' : 'eye') + '</button>' : '') +
-          '</div>';
-        }).join('');
-        photosLoad();
-      }
-      list.onclick = function(e) {
-        var row = e.target.closest('.row');
-        if (!row) return;
-        var ref = row.getAttribute('data-r');
-        if (e.target.closest('.rn')) { renameView(ref, row.getAttribute('data-n'), row.getAttribute('data-u')); return; }
-        var hb = e.target.closest('.hide');
-        if (hb) {
-          var cur = hb.getAttribute('data-h') === '1';
-          api('/api/hide', {method: 'POST', body: JSON.stringify({ref: ref, hidden: !cur})}).then(function() {
-            cache.colleagues.forEach(function(u) { if (u.ref === ref) u.hidden = !cur; });
-            draw(cache.colleagues);
-          }).catch(function() { msg('Не удалось сохранить'); });
-          return;
+      if (request.method === 'POST') {
+        if (!isAdmin) return json({ error: 'forbidden' }, 403);
+        const body = await request.json().catch(() => ({}));
+        const text = typeof body.text === 'string' ? body.text.trim() : '';
+        if (!text || text.length > 1000 || LEAK.test(text)) return json({ error: 'bad_request' }, 400);
+        let targetId = 0;
+        if (body.ref && body.ref !== 'all') {
+          targetId = await resolveRef(body.ref, env);
+          if (!targetId) return json({ error: 'not_found' }, 404);
         }
-        var u = row.getAttribute('data-u');
-        if (u) tg.openTelegramLink('https://t.me/' + u);
-        else msg('У сотрудника не указан username');
-      };
-      withData(kind, my, draw);
-    }
-
-    function sub(t, html) {
-      setBack(true);
-      app.onclick = null;
-      app.innerHTML =
-        '<div class="sub-wrap">' +
-          '<div class="sub-head"><button class="ib" id="bk" aria-label="Назад">' + ico('back') + '</button><div class="stitle">' + t + '</div></div>' +
-          '<div class="fcard" id="sb">' + html + '</div>' +
-        '</div>';
-      $('bk').onclick = shell;
-    }
-
-    function renameView(ref, cur, un) {
-      sub('Данные коллеги',
-        '<div class="fgrp"><label>Имя (видят все)</label><input id="nm" maxlength="60" value="' + esc(cur) + '"></div>' +
-        '<div class="fgrp"><label>Username в Telegram, без @</label><input id="un" maxlength="40" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="например ivan_petrov" value="' + esc(un) + '"></div>' +
-        '<button class="btn" id="ok">Сохранить</button>' +
-        '<button class="btn ghost" id="rs">Сбросить к данным Telegram</button>'
-      );
-      function send(b) {
-        b.ref = ref;
-        j('/api/rename', {method: 'POST', body: JSON.stringify(b)})
-          .then(function() { return getData('colleagues', true); })
-          .then(shell)
-          .catch(function(e) {
-            msg(e && e.msg && /[а-яА-Я]/.test(e.msg) ? e.msg : 'Не удалось сохранить (ошибка ' + ((e && e.status) || 'сети') + ')');
-          });
+        await DB(env).prepare(
+          'INSERT INTO pins (user_id, text, created_at) VALUES (?, ?, ?)'
+        ).bind(targetId, text, now()).run();
+        return json({ ok: true });
       }
-      $('ok').onclick = function() {
-        var v = $('nm').value.trim(), u = $('un').value.trim().replace(/^@/, ''), b = {};
-        if (!v) return msg('Введите имя');
-        if (v !== cur) b.name = v;
-        if (u !== un) b.username = u;
-        if (!b.name && b.username === undefined) return shell();
-        send(b);
-      };
-      $('rs').onclick = function() { send({name: '', username: ''}); };
-    }
-
-    function content(kind, my) {
-      var list = $('list');
-      function draw() {
-        var items = cache[kind] || [];
-        list.innerHTML = items.length ? items.map(function(it, i) {
-          return '<div class="item"><b><span>' + esc(it.title) + '</span>' + (me.isAdmin ? '<span class="del" data-d="' + i + '">' + ico('close') + '</span>' : '') + '</b><div class="txt">' + esc(it.text) + '</div></div>';
-        }).join('') : '<div class="empty">Пока ничего нет.</div>';
+      if (request.method === 'DELETE') {
+        const id = Number(url.searchParams.get('id'));
+        if (!id) return json({ error: 'bad_request' }, 400);
+        if (isAdmin) {
+          await DB(env).prepare('DELETE FROM pins WHERE id = ?').bind(id).run();
+        } else {
+          await DB(env).prepare('DELETE FROM pins WHERE id = ? AND user_id = ?').bind(id, me).run();
+        }
+        return json({ ok: true });
       }
-      function save(next, done) {
-        j('/api/content/' + kind, {method: 'PUT', body: JSON.stringify({items: next})}).then(function() {
-          cache[kind] = next;
-          done();
-        }).catch(function() { msg('Не удалось сохранить'); });
+    }
+
+    if (path.startsWith('/api/photo/') && request.method === 'GET') {
+      const seg = path.slice('/api/photo/'.length);
+      if (seg === 'bot') return photoResponse(env, Number(env.BOT_TOKEN.split(':')[0]));
+      const target = await resolveRef(seg, env);
+      if (!target || isAdminUser(env, target)) return new Response(null, { status: 404 });
+      return photoResponse(env, target);
+    }
+
+    if (path === '/api/rename' && request.method === 'POST') {
+      if (!isAdmin) return json({ error: 'forbidden' }, 403);
+      const body = await request.json().catch(() => ({}));
+      const target = body.ref ? await resolveRef(body.ref, env) : null;
+      if (!target) return json({ error: 'not_found' }, 404);
+      const sets = [], vals = [];
+      if (typeof body.name === 'string') {
+        const name = body.name.trim();
+        if (name.length > 60 || LEAK.test(name)) return json({ error: 'bad_request' }, 400);
+        sets.push('custom_name = ?'); vals.push(name || null);
       }
-      list.onclick = function(e) {
-        var i = e.target.getAttribute('data-d');
-        if (i !== null) tg.showConfirm('Удалить запись?', function(ok) {
-          if (ok) save(cache[kind].filter(function(_, k) { return k != i; }), draw);
-        });
-      };
-      withData(kind, my, draw);
-      var add = $('add');
-      if (add) add.onclick = function() {
-        sub('Новое уведомление',
-          '<div class="fgrp"><label>Заголовок</label><input id="t" maxlength="80" placeholder="Введите заголовок"></div>' +
-          '<div class="fgrp"><label>Текст уведомления</label><textarea id="x" rows="4" maxlength="1000" placeholder="Введите текст"></textarea></div>' +
-          '<button class="btn" id="ok">Сохранить</button>'
-        );
-        $('ok').onclick = function() {
-          var t = $('t').value.trim(), x = $('x').value.trim();
-          if (!t || !x) return msg('Заполните заголовок и текст');
-          save([{title: t, text: x}].concat(cache[kind] || []), shell);
-        };
-      };
+      if (typeof body.username === 'string') {
+        const un = body.username.trim().replace(/^https?:\/\/t\.me\//i, '').replace(/^@/, '');
+        if (un && !/^[A-Za-z][A-Za-z0-9_]{4,31}$/.test(un)) return json({ error: 'Некорректный username' }, 400);
+        sets.push('custom_username = ?'); vals.push(un || null);
+      }
+      if (!sets.length) return json({ error: 'bad_request' }, 400);
+      await DB(env).prepare('UPDATE users SET ' + sets.join(', ') + ' WHERE user_id = ?').bind(...vals, target).run();
+      return json({ ok: true });
     }
 
-    function editHeader() {
-      var h = me.header,
-          f = [['title', 'Должность'], ['company', 'Место работы'], ['phone', 'Телефон'], ['email', 'Почта']];
-      sub('Информация',
-        f.map(function(x) {
-          return '<div class="fgrp"><label>' + x[1] + '</label><input id="f_' + x[0] + '" value="' + esc(h[x[0]]) + '"></div>';
-        }).join('') + '<button class="btn" id="ok">Сохранить</button>'
-      );
-      $('ok').onclick = function() {
-        var b = {};
-        f.forEach(function(x) { b[x[0]] = $('f_' + x[0]).value.trim(); });
-        j('/api/header', {method: 'PUT', body: JSON.stringify(b)}).then(function(r) {
-          me.header = r.header;
-          shell();
-        }).catch(function(e) {
-          msg(e && e.msg && /[а-яА-Я]/.test(e.msg) ? e.msg : 'Не удалось сохранить (ошибка ' + ((e && e.status) || 'сети') + ')');
-        });
-      };
+    if (path === '/api/hide' && request.method === 'POST') {
+      if (!isAdmin) return json({ error: 'forbidden' }, 403);
+      const body = await request.json().catch(() => ({}));
+      const target = body.ref ? await resolveRef(body.ref, env) : null;
+      if (!target) return json({ error: 'not_found' }, 404);
+      await DB(env).prepare('UPDATE users SET hidden = ? WHERE user_id = ?').bind(body.hidden ? 1 : 0, target).run();
+      return json({ ok: true });
     }
 
-    // ---- запуск: всё грузится один раз ----
-    if (!tg || !tg.initData) {
-      app.innerHTML = '<div class="empty">Откройте приложение через кнопку меню в Telegram.</div>';
-    } else {
-      tg.ready();
-      tg.expand && tg.expand();
-      applyTheme();
-      tg.onEvent && tg.onEvent('themeChanged', applyTheme);
-      app.innerHTML = '<div class="empty">Загрузка…</div>';
-      var quiet = function(k) { return getData(k).catch(function() { return null; }); };
-      Promise.all([j('/api/me'), quiet('colleagues'), quiet('pins'), quiet('notifications')])
-        .then(function(r) {
-          me = r[0];
-          photoLoad('bot');
-          (r[1] || []).forEach(function(u) { photoLoad(u.ref); });
-          shell();
-        })
-        .catch(fail);
+    if (path.startsWith('/api/content/')) {
+      const kind = path.slice('/api/content/'.length);
+      if (!['instructions', 'notifications'].includes(kind)) return json({ error: 'not_found' }, 404);
+      if (request.method === 'GET') return json({ items: await getContent(env, kind) });
+      if (request.method === 'PUT') {
+        if (!isAdmin) return json({ error: 'forbidden' }, 403);
+        const body = await request.json().catch(() => ({}));
+        const items = body.items;
+        const bad = !Array.isArray(items) || items.length > 30 || items.some((i) =>
+          typeof i?.title !== 'string' || typeof i?.text !== 'string' || !i.title.trim() || !i.text.trim() ||
+          i.title.length > 80 || i.text.length > 1000 || LEAK.test(i.title + ' ' + i.text));
+        if (bad) return json({ error: 'bad_request' }, 400);
+        const clean = items.map((i) => ({ title: i.title.trim(), text: i.text.trim() }));
+        await setSetting(env, kind, JSON.stringify(clean));
+        return json({ ok: true });
+      }
     }
-  </script>
-</body>
-</html>
+
+    // Только владелец: правка шапки
+    if (path === '/api/header' && request.method === 'PUT') {
+      if (!isAdmin) return json({ error: 'forbidden' }, 403);
+      const body = await request.json().catch(() => ({}));
+      const str = (v) => (typeof v === 'string' ? v.trim() : '');
+      let phone = str(body.phone).replace(/[\s\-().]/g, '');
+      if (/^8\d{10}$/.test(phone)) phone = '+7' + phone.slice(1);
+      if (/^7\d{10}$/.test(phone)) phone = '+' + phone;
+      const header = { title: str(body.title), company: str(body.company), phone, email: str(body.email) };
+      const err = validateHeader(header);
+      if (err) return json({ error: err }, 400);
+      await DB(env).prepare(
+        "INSERT INTO settings (key, value) VALUES ('header', ?1) " +
+        'ON CONFLICT(key) DO UPDATE SET value = ?1'
+      ).bind(JSON.stringify(header)).run();
+      return json({ ok: true, header });
+    }
+  } catch (e) {
+    console.error('miniapp api error', e);
+    return json({ error: 'server_error' }, 500);
+  }
+
+  return json({ error: 'not_found' }, 404);
+}
