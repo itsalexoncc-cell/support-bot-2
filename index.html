@@ -178,7 +178,7 @@
   <div id="app"></div>
   <script>
     // Адрес вашего воркера на Cloudflare (без слэша в конце)
-    var API_BASE = 'https://support-bot-2.itsalexoncc.workers.dev';
+    var API_BASE = 'https://YOUR-WORKER.workers.dev';
 
     var tg = window.Telegram && Telegram.WebApp,
         app = document.getElementById('app'),
@@ -193,7 +193,8 @@
     var URLS = {
       colleagues: '/api/colleagues',
       pins: '/api/pins',
-      notifications: '/api/content/notifications'
+      notifications: '/api/content/notifications',
+      avlog: '/api/avatars/log'
     };
 
     function esc(s) {
@@ -324,7 +325,7 @@
       }
       if (tg.showPopup) {
         tg.showPopup({
-          title: val, message: '\u2800',
+          title: val, message: 'Что сделать?',
           buttons: [{id: 'go', type: 'default', text: go}, {id: 'cp', type: 'default', text: cp}, {type: 'cancel'}]
         }, act);
       } else if (confirm(go + '?')) act('go');
@@ -537,6 +538,8 @@
         list.innerHTML = items.length ? items.map(function(it, i) {
           return '<div class="item"><b><span>' + esc(it.title) + '</span>' + (me.isAdmin ? '<span class="del" data-d="' + i + '">' + ico('close') + '</span>' : '') + '</b><div class="txt">' + esc(it.text) + '</div></div>';
         }).join('') : '<div class="empty">Пока ничего нет.</div>';
+        list.insertAdjacentHTML('beforeend', avatarSection());
+        photosLoad();
       }
       function save(next, done) {
         j('/api/content/' + kind, {method: 'PUT', body: JSON.stringify({items: next})}).then(function() {
@@ -586,6 +589,53 @@
       };
     }
 
+    function circlePng(it) {
+      return api('/api/photo/' + it.ref).then(function(r) { return r.blob(); })
+        .then(function(b) { return createImageBitmap(b); })
+        .catch(function() { return null; })
+        .then(function(img) {
+          var c = document.createElement('canvas'), x;
+          c.width = c.height = 100;
+          x = c.getContext('2d');
+          x.beginPath(); x.arc(50, 50, 50, 0, Math.PI * 2); x.closePath(); x.clip();
+          if (img) {
+            var s = Math.min(img.width, img.height);
+            x.drawImage(img, (img.width - s) / 2, (img.height - s) / 2, s, s, 0, 0, 100, 100);
+          } else {
+            x.fillStyle = '#9aa0a6'; x.fillRect(0, 0, 100, 100);
+            x.fillStyle = '#fff'; x.font = '600 48px sans-serif';
+            x.textAlign = 'center'; x.textBaseline = 'middle';
+            x.fillText(it.initial || '?', 50, 54);
+          }
+          return c.toDataURL('image/png').split(',')[1];
+        });
+    }
+
+    function avatarJob() {
+      if (!me.isAdmin) return;
+      j('/api/avatars/pending').then(function(d) {
+        var q = d.items.slice();
+        (function next() {
+          var it = q.shift();
+          if (!it) { getData('avlog', true).then(function() { if (tab === 'notifications') showTab(); }, function() {}); return; }
+          circlePng(it).then(function(png) {
+            return j('/api/avatars/emoji', {method: 'POST', body: JSON.stringify({ref: it.ref, png: png})});
+          }).then(next, next);
+        })();
+      }).catch(function() {});
+    }
+
+    function avatarSection() {
+      if (!me.isAdmin) return '';
+      var a = cache.avlog || [];
+      return '<div class="sec" style="margin:14px 4px 8px">Аватарки · только админам</div>' +
+        (a.length ? a.map(function(e) {
+          var d = new Date(e.at * 1000).toLocaleString('ru-RU', {day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit'});
+          return '<div class="row">' + av(e.ref, e.initial, 's') +
+            '<div class="nm"><b>' + esc(e.name) + '</b><small>Новая аватарка · ' + d + '</small></div></div>';
+        }).join('') : '<div class="empty">Новых аватарок пока нет.</div>');
+    }
+
     // ---- запуск: всё грузится один раз ----
     if (!tg || !tg.initData) {
       app.innerHTML = '<div class="empty">Откройте приложение через кнопку меню в Telegram.</div>';
@@ -601,6 +651,8 @@
           photoLoad('bot');
           (r[1] || []).forEach(function(u) { photoLoad(u.ref); });
           shell();
+          if (me.isAdmin) getData('avlog').catch(function() {});
+          avatarJob();
         })
         .catch(fail);
     }
