@@ -114,6 +114,9 @@
     .hide:active, .rn:active { transform: scale(.9); }
     .hide svg.i, .rn svg.i { width: 19px; height: 19px; }
     .del svg { pointer-events: none; }
+    .stt { font-size: 12px; font-weight: 600; padding: 2px 9px; border-radius: 10px; display: inline-block; }
+    .stt.on { color: #22a559; background: rgba(34,165,89,.15); }
+    .stt.off { color: #e5484d; background: rgba(229,72,77,.15); }
     .del svg.i { width: 18px; height: 18px; display: block; }
     .item b span.del { display: flex; align-items: center; }
     .empty { background: var(--panel); border-radius: var(--r); color: var(--hint); text-align: center; padding: 28px 14px; }
@@ -178,7 +181,7 @@
   <div id="app"></div>
   <script>
     // Адрес вашего воркера на Cloudflare (без слэша в конце)
-    var API_BASE = 'https://support-bot-2.itsalexoncc.workers.dev';
+    var API_BASE = 'https://YOUR-WORKER.workers.dev';
 
     var tg = window.Telegram && Telegram.WebApp,
         app = document.getElementById('app'),
@@ -548,6 +551,8 @@
         }).catch(function() { msg('Не удалось сохранить'); });
       }
       list.onclick = function(e) {
+        var ad = e.target.closest('[data-ad]');
+        if (ad) { delAvatar(ad.getAttribute('data-ad')); return; }
         var i = e.target.getAttribute('data-d');
         if (i !== null) tg.showConfirm('Удалить запись?', function(ok) {
           if (ok) save(cache[kind].filter(function(_, k) { return k != i; }), draw);
@@ -603,9 +608,10 @@
             x.drawImage(img, (img.width - s) / 2, (img.height - s) / 2, s, s, 0, 0, 100, 100);
           } else {
             x.fillStyle = '#9aa0a6'; x.fillRect(0, 0, 100, 100);
-            x.fillStyle = '#fff'; x.font = '600 48px sans-serif';
+            var ini = it.initial || '?';
+            x.fillStyle = '#fff'; x.font = '600 ' + (ini.length > 1 ? 40 : 48) + 'px sans-serif';
             x.textAlign = 'center'; x.textBaseline = 'middle';
-            x.fillText(it.initial || '?', 50, 54);
+            x.fillText(ini, 50, 54);
           }
           return c.toDataURL('image/png').split(',')[1];
         });
@@ -632,8 +638,20 @@
         (a.length ? a.map(function(e) {
           var d = new Date(e.at * 1000).toLocaleString('ru-RU', {day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit'});
           return '<div class="row">' + av(e.ref, e.initial, 's') +
-            '<div class="nm"><b>' + esc(e.name) + '</b><small>Новая аватарка · ' + d + '</small></div></div>';
+            '<div class="nm"><b>' + esc(e.name) + '</b><small>Новая аватарка · ' + d + '</small>' +
+              '<div style="margin-top:3px"><span class="stt ' + (e.actual ? 'on' : 'off') + '">' + (e.actual ? 'Актуальная' : 'Устаревшая') + '</span></div></div>' +
+            '<button class="hide" data-ad="' + e.id + '" aria-label="Удалить эмодзи">' + ico('close') + '</button></div>';
         }).join('') : '<div class="empty">Новых аватарок пока нет.</div>');
+    }
+
+    function delAvatar(id) {
+      tg.showConfirm('Удалить эмодзи из пака? Иконка топика с ней может пропасть.', function(ok) {
+        if (!ok) return;
+        api('/api/avatars/log?id=' + id, {method: 'DELETE'}).then(function() {
+          cache.avlog = (cache.avlog || []).filter(function(e) { return String(e.id) !== id; });
+          if (tab === 'notifications') showTab();
+        }).catch(function() { msg('Не удалось удалить'); });
+      });
     }
 
     // ---- запуск: всё грузится один раз ----
