@@ -224,9 +224,16 @@
     function msg(t) { tg.showAlert ? tg.showAlert(t) : alert(t); }
 
     // Кэш: повторный запрос идёт в сеть только при force
+    var inflight = {};
     function getData(key, force) {
       if (!force && cache[key]) return Promise.resolve(cache[key]);
-      return j(URLS[key]).then(function(d) { return (cache[key] = d.items); });
+      if (!force && inflight[key]) return inflight[key];
+      var p = j(URLS[key]).then(function(d) {
+        delete inflight[key];
+        return (cache[key] = d.items);
+      }, function(e) { delete inflight[key]; throw e; });
+      inflight[key] = p;
+      return p;
     }
 
     function fail(e) {
@@ -661,18 +668,28 @@
       tg.ready();
       applyTheme();
       tg.onEvent && tg.onEvent('themeChanged', applyTheme);
-      app.innerHTML = '<div class="empty">Загрузка…</div>';
       var quiet = function(k) { return getData(k).catch(function() { return null; }); };
-      Promise.all([j('/api/me'), quiet('colleagues'), quiet('pins'), quiet('notifications')])
-        .then(function(r) {
-          me = r[0];
-          photoLoad('bot');
-          (r[1] || []).forEach(function(u) { photoLoad(u.ref); });
-          shell();
-          if (me.isAdmin) getData('avlog').catch(function() {});
-          avatarJob();
-        })
-        .catch(fail);
+      var saved = null;
+      try { saved = JSON.parse(localStorage.getItem('me_v1')); } catch(e) {}
+
+      // Шапка рисуется сразу (из памяти), остальное догружается в фоне
+      function start(d, fromCache) {
+        var changed = !me || JSON.stringify(me) !== JSON.stringify(d);
+        me = d;
+        try { localStorage.setItem('me_v1', JSON.stringify(d)); } catch(e) {}
+        if (changed) shell();
+        if (fromCache) return;
+        quiet('colleagues').then(function(items) { (items || []).forEach(function(u) { photoLoad(u.ref); }); });
+        quiet('pins');
+        quiet('notifications');
+        if (me.isAdmin) quiet('avlog');
+        avatarJob();
+      }
+
+      if (saved && saved.header) start(saved, true);
+      else app.innerHTML = '<div class="empty">Загрузка…</div>';
+      j('/api/me').then(function(d) { start(d, false); })
+        .catch(function(e) { if (!me || (e && (e.status === 401 || e.status === 403))) fail(e); });
     }
   </script>
 </body>
