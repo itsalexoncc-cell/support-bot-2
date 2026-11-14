@@ -2,7 +2,7 @@
 <html lang="ru">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
   <title>Смарт Деним</title>
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <style>
@@ -28,7 +28,7 @@
       }
     }
     * { box-sizing: border-box; margin: 0; -webkit-tap-highlight-color: transparent; }
-    html { background: var(--page); height: 100%; }
+    html { background: var(--page); height: 100%; touch-action: manipulation; -webkit-text-size-adjust: 100%; }
     body {
       background: var(--page);
       color: var(--tx);
@@ -182,14 +182,22 @@
     .cal-d { aspect-ratio: 1; border: 0; border-radius: 50%; background: var(--glass); color: var(--tx); font: inherit; font-size: 15px; display: flex; align-items: center; justify-content: center; padding: 0; }
     .cal-d.e { visibility: hidden; }
     .cal-d.on { background: var(--ac); color: var(--act); font-weight: 600; }
+    .cal-d.sick { background: #e5484d; color: #fff; font-weight: 600; }
+    .cal-d.vac { background: #34c759; color: #fff; font-weight: 600; }
+    .cal-modes { display: flex; gap: 6px; }
+    .cal-mode { flex: 1; border: 0; border-radius: 999px; padding: 9px 4px; background: var(--glass); color: var(--tx); font: inherit; font-size: 13px; font-weight: 500; display: flex; align-items: center; justify-content: center; gap: 6px; }
+    .cal-mode.sel { background: var(--card); box-shadow: 0 3px 10px rgba(0,0,0,.14); font-weight: 600; }
+    .cal-mode i, .cal-leg i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; flex: none; }
+    .k-work { background: var(--ac); } .k-sick { background: #e5484d; } .k-vac { background: #34c759; }
     .cal-d.today { box-shadow: inset 0 0 0 2px var(--ac); }
     .cal-d.ro { pointer-events: none; }
-    .cal-leg { display: flex; align-items: center; gap: 8px; color: var(--hint); font-size: 13px; padding: 2px 6px 0; }
-    .cal-leg i { width: 12px; height: 12px; border-radius: 50%; background: var(--ac); display: inline-block; flex: none; }
+    .cal-leg { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px; color: var(--hint); font-size: 13px; padding: 2px 6px 0; }
+    .cal-leg span { display: flex; align-items: center; gap: 6px; }
+    .cal-note { color: var(--hint); font-size: 12px; padding: 0 6px; }
     input[type=file] { font-size: 14px; }
 
     /* Окно QR: размер как у системного окна iOS */
-    .dlg { position: fixed; inset: 0; background: rgba(0,0,0,.4); display: flex; align-items: center; justify-content: center; z-index: 50; }
+    .dlg { position: fixed; inset: 0; background: rgba(0,0,0,.4); display: flex; align-items: flex-start; justify-content: center; z-index: 50; padding-top: calc(env(safe-area-inset-top, 0px) + 28px); }
     .dlg-box { width: 270px; max-width: calc(100% - 48px); background: var(--card); border-radius: 14px; overflow: hidden; text-align: center; box-shadow: 0 10px 40px rgba(0,0,0,.25); }
     .dlg-t { font-weight: 600; font-size: 17px; padding: 18px 16px 12px; }
     .dlg-img { display: block; width: 200px; height: 200px; margin: 0 auto 16px; border-radius: 8px; object-fit: contain; background: #fff; }
@@ -199,8 +207,13 @@
 <body>
   <div id="app"></div>
   <script>
+    // Запрет зума (двойной тап и щипок)
+    ['gesturestart', 'gesturechange', 'gestureend', 'dblclick'].forEach(function(n) {
+      document.addEventListener(n, function(e) { e.preventDefault(); });
+    });
+
     // Адрес вашего воркера на Cloudflare (без слэша в конце)
-    var API_BASE = 'https://support-bot-2.itsalexoncc.workers.dev';
+    var API_BASE = 'https://YOUR-WORKER.workers.dev';
 
     var tg = window.Telegram && Telegram.WebApp,
         app = document.getElementById('app'),
@@ -381,7 +394,7 @@
               '<h1>' + esc(me.bot) + '</h1>' +
               '<div class="subl">Центр управления общением</div>' +
             '</div>' +
-            '<div class="acts">' + act('tel', h.phone, 'Позвонить') + act('cal', '1', 'График') + act('mail', h.email, 'Написать') + act('qr', (me.qr || me.isAdmin) ? '1' : '', 'QR') + '</div>' +
+            '<div class="acts">' + act('cal', '1', 'График') + act('tel', h.phone, 'Позвонить') + act('mail', h.email, 'Написать') + act('qr', (me.qr || me.isAdmin) ? '1' : '', 'QR') + '</div>' +
             '<div class="bio"><small>Информация</small>' +
               ((h.title || h.company)
                 ? (h.title ? '<p><b>' + esc(h.title) + '</b></p>' : '') + (h.company ? '<p>' + esc(h.company) + '</p>' : '')
@@ -673,8 +686,17 @@
     }
 
     // ---- график работы ----
-    var calY, calM;
+    var calY, calM, calMode = 'work',
+        KINDS = [['work', 'Рабочий', 'on'], ['sick', 'Больничный', 'sick'], ['vacation', 'Отпуск', 'vac']];
     function pad(n) { return (n < 10 ? '0' : '') + n; }
+
+    function schedMap() {
+      var map = {};
+      (cache.schedule || []).forEach(function(e) {
+        if (typeof e === 'string') map[e] = 'work'; else map[e.d] = e.k;
+      });
+      return map;
+    }
 
     function scheduleView() {
       var d = new Date();
@@ -689,6 +711,8 @@
           drawCal();
           return;
         }
+        var md = e.target.closest('[data-mode]');
+        if (md) { calMode = md.getAttribute('data-mode'); drawCal(); return; }
         var k = e.target.closest('[data-k]');
         if (k && me.isAdmin) toggleDay(k.getAttribute('data-k'));
       };
@@ -702,33 +726,47 @@
     function drawCal() {
       var box = $('cal');
       if (!box) return;
-      var days = cache.schedule || [],
+      var map = schedMap(),
           first = new Date(calY, calM, 1),
           off = (first.getDay() + 6) % 7,
           n = new Date(calY, calM + 1, 0).getDate(),
           t = new Date(),
           tk = t.getFullYear() + '-' + pad(t.getMonth() + 1) + '-' + pad(t.getDate()),
-          html = '<div class="cal-h"><button class="ib" data-m="-1" aria-label="Назад">' + ico('back') + '</button>' +
-            '<div class="cal-t">' + first.toLocaleDateString('ru-RU', {month: 'long', year: 'numeric'}) + '</div>' +
-            '<button class="ib" data-m="1" aria-label="Вперёд">' + ico('next') + '</button></div><div class="cal-g">',
-          i;
+          cls = {work: 'on', sick: 'sick', vacation: 'vac'},
+          dot = {work: 'k-work', sick: 'k-sick', vacation: 'k-vac'},
+          html = '', i;
+      if (me.isAdmin) {
+        html += '<div class="cal-modes">' + KINDS.map(function(x) {
+          return '<button class="cal-mode' + (calMode === x[0] ? ' sel' : '') + '" data-mode="' + x[0] + '"><i class="' + dot[x[0]] + '"></i>' + x[1] + '</button>';
+        }).join('') + '</div>';
+      }
+      html += '<div class="cal-h"><button class="ib" data-m="-1" aria-label="Назад">' + ico('back') + '</button>' +
+        '<div class="cal-t">' + first.toLocaleDateString('ru-RU', {month: 'long', year: 'numeric'}) + '</div>' +
+        '<button class="ib" data-m="1" aria-label="Вперёд">' + ico('next') + '</button></div><div class="cal-g">';
       ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'].forEach(function(w) { html += '<div class="cal-w">' + w + '</div>'; });
       for (i = 0; i < off; i++) html += '<div class="cal-d e"></div>';
       for (i = 1; i <= n; i++) {
-        var key = calY + '-' + pad(calM + 1) + '-' + pad(i);
-        html += '<button class="cal-d' + (days.indexOf(key) >= 0 ? ' on' : '') + (key === tk ? ' today' : '') + (me.isAdmin ? '' : ' ro') + '" data-k="' + key + '">' + i + '</button>';
+        var key = calY + '-' + pad(calM + 1) + '-' + pad(i), k = map[key];
+        html += '<button class="cal-d' + (k ? ' ' + cls[k] : '') + (key === tk ? ' today' : '') + (me.isAdmin ? '' : ' ro') + '" data-k="' + key + '">' + i + '</button>';
       }
-      html += '</div><div class="cal-leg"><i></i>Рабочий день' + (me.isAdmin ? ' · нажмите на день, чтобы отметить или снять' : '') + '</div>';
+      html += '</div><div class="cal-leg">' + KINDS.map(function(x) {
+        return '<span><i class="' + dot[x[0]] + '"></i>' + x[1] + '</span>';
+      }).join('') + '</div>';
+      if (me.isAdmin) html += '<div class="cal-note">Выберите тип и нажимайте на дни. Повторный тап по тому же типу снимает отметку.</div>';
       box.innerHTML = html;
     }
 
     function toggleDay(k) {
-      var s = cache.schedule || (cache.schedule = []), i = s.indexOf(k), on = i < 0;
-      if (on) s.push(k); else s.splice(i, 1);
+      var prev = schedMap()[k] || null,
+          next = prev === calMode ? null : calMode,
+          list = (cache.schedule || []).map(function(e) { return typeof e === 'string' ? {d: e, k: 'work'} : e; }),
+          old = list.slice();
+      list = list.filter(function(e) { return e.d !== k; });
+      if (next) list.push({d: k, k: next});
+      cache.schedule = list;
       drawCal();
-      j('/api/schedule', {method: 'PUT', body: JSON.stringify({date: k, on: on})}).catch(function() {
-        var s2 = cache.schedule, i2 = s2.indexOf(k);
-        if (on && i2 >= 0) s2.splice(i2, 1); else if (!on && i2 < 0) s2.push(k);
+      j('/api/schedule', {method: 'PUT', body: JSON.stringify({date: k, kind: next})}).catch(function() {
+        cache.schedule = old;
         drawCal();
         msg('Не удалось сохранить');
       });
