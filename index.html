@@ -194,6 +194,7 @@
     .cal-leg { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px; color: var(--hint); font-size: 13px; padding: 2px 6px 0; }
     .cal-leg span { display: flex; align-items: center; gap: 6px; }
     .cal-note { color: var(--hint); font-size: 12px; padding: 0 6px; }
+    .stitle.cnt { margin-left: auto; color: var(--hint); white-space: nowrap; }
     #cal { display: flex; flex-direction: column; gap: 14px; }
     input[type=file] { font-size: 14px; }
 
@@ -703,6 +704,7 @@
       var d = new Date();
       calY = d.getFullYear(); calM = d.getMonth();
       sub('График работы', '<div id="cal"></div>');
+      document.querySelector('.sub-head').insertAdjacentHTML('beforeend', '<div class="stitle cnt" id="cnt"></div>');
       $('cal').onclick = function(e) {
         var m = e.target.closest('[data-m]');
         if (m) {
@@ -755,6 +757,10 @@
       }).join('') + '</div>';
       if (me.isAdmin) html += '<div class="cal-note">Выберите тип и нажимайте на дни. Повторный тап по тому же типу снимает отметку.</div>';
       box.innerHTML = html;
+      var pre = calY + '-' + pad(calM + 1) + '-', shifts = 0, c = $('cnt'), r10, r100;
+      Object.keys(map).forEach(function(d) { if (d.indexOf(pre) === 0 && map[d] === 'work') shifts++; });
+      r10 = shifts % 10; r100 = shifts % 100;
+      if (c) c.textContent = shifts + ' ' + (r10 === 1 && r100 !== 11 ? 'смена' : (r10 >= 2 && r10 <= 4 && (r100 < 12 || r100 > 14) ? 'смены' : 'смен'));
     }
 
     function toggleDay(k) {
