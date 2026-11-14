@@ -626,6 +626,7 @@
 
     function avatarJob() {
       if (!me.isAdmin) return;
+      var shown = false;
       j('/api/avatars/pending').then(function(d) {
         var q = d.items.slice();
         (function next() {
@@ -633,7 +634,10 @@
           if (!it) { getData('avlog', true).then(function() { if (tab === 'notifications') showTab(); }, function() {}); return; }
           circlePng(it).then(function(png) {
             return j('/api/avatars/emoji', {method: 'POST', body: JSON.stringify({ref: it.ref, png: png})});
-          }).then(next, next);
+          }).then(next, function(e) {
+            if (!shown) { shown = true; msg('Аватарки: ' + ((e && e.msg) || (e && e.status) || 'ошибка сети')); }
+            next();
+          });
         })();
       }).catch(function() {});
     }
@@ -670,13 +674,13 @@
       tg.onEvent && tg.onEvent('themeChanged', applyTheme);
       var quiet = function(k) { return getData(k).catch(function() { return null; }); };
       var saved = null;
-      try { saved = JSON.parse(localStorage.getItem('me_v1')); } catch(e) {}
+      try { saved = JSON.parse(localStorage.getItem('me:' + API_BASE)); } catch(e) {}
 
       // Шапка рисуется сразу (из памяти), остальное догружается в фоне
       function start(d, fromCache) {
         var changed = !me || JSON.stringify(me) !== JSON.stringify(d);
         me = d;
-        try { localStorage.setItem('me_v1', JSON.stringify(d)); } catch(e) {}
+        try { localStorage.setItem('me:' + API_BASE, JSON.stringify(d)); } catch(e) {}
         if (changed) shell();
         if (fromCache) return;
         quiet('colleagues').then(function(items) { (items || []).forEach(function(u) { photoLoad(u.ref); }); });
