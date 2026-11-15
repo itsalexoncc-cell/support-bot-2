@@ -175,26 +175,32 @@
     }
     .btn:active { transform: scale(.98); }
     .btn.ghost { background: var(--glass); color: var(--ac); }
+
+    /* График */
+    .cal-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .stitle.cnt { color: var(--hint); white-space: nowrap; }
     .cal-h { display: flex; align-items: center; justify-content: space-between; }
     .cal-t { font-weight: 700; font-size: 17px; text-transform: capitalize; }
     .cal-g { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; }
     .cal-w { color: var(--hint); font-size: 12px; text-align: center; padding: 2px 0; }
     .cal-d { aspect-ratio: 1; border: 0; border-radius: 50%; background: var(--glass); color: var(--tx); font: inherit; font-size: 15px; display: flex; align-items: center; justify-content: center; padding: 0; }
-    .cal-d.e { visibility: hidden; }
+    .cal-d.e { visibility: hidden; pointer-events: none; }
     .cal-d.on { background: var(--ac); color: var(--act); font-weight: 600; }
     .cal-d.sick { background: #e5484d; color: #fff; font-weight: 600; }
     .cal-d.vac { background: #34c759; color: #fff; font-weight: 600; }
-    .cal-modes { display: flex; gap: 6px; }
-    .cal-mode { flex: 1; border: 0; border-radius: 999px; padding: 9px 4px; background: var(--glass); color: var(--tx); font: inherit; font-size: 13px; font-weight: 500; display: flex; align-items: center; justify-content: center; gap: 6px; }
-    .cal-mode.sel { background: var(--card); box-shadow: 0 3px 10px rgba(0,0,0,.14); font-weight: 600; }
-    .cal-mode i, .cal-leg i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; flex: none; }
-    .k-work { background: var(--ac); } .k-sick { background: #e5484d; } .k-vac { background: #34c759; }
     .cal-d.today { box-shadow: inset 0 0 0 2px var(--ac); }
-    .cal-d.ro { pointer-events: none; }
+    .cal-d.sel { outline: 2px solid var(--tx); outline-offset: 2px; }
+    .k-work { background: var(--ac); } .k-sick { background: #e5484d; } .k-vac { background: #34c759; }
     .cal-leg { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px; color: var(--hint); font-size: 13px; padding: 2px 6px 0; }
     .cal-leg span { display: flex; align-items: center; gap: 6px; }
-    .cal-note { color: var(--hint); font-size: 12px; padding: 0 6px; }
-    .stitle.cnt { margin-left: auto; color: var(--hint); white-space: nowrap; }
+    .cal-leg i, .cal-chip i, .cal-line i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; flex: none; }
+    .cal-note { color: var(--hint); font-size: 13px; }
+    .cal-info { background: var(--glass); border-radius: 20px; padding: 14px; display: flex; flex-direction: column; gap: 10px; }
+    .cal-it { font-weight: 700; font-size: 16px; text-transform: capitalize; }
+    .cal-line { display: flex; align-items: center; gap: 8px; word-break: break-word; }
+    .cal-chips { display: flex; gap: 6px; }
+    .cal-chip { flex: 1; border: 0; border-radius: 999px; padding: 9px 4px; background: var(--card); color: var(--tx); font: inherit; font-size: 13px; font-weight: 500; display: flex; align-items: center; justify-content: center; gap: 6px; opacity: .6; }
+    .cal-chip.sel { opacity: 1; font-weight: 600; box-shadow: 0 3px 10px rgba(0,0,0,.14); }
     #cal { display: flex; flex-direction: column; gap: 14px; }
     input[type=file] { font-size: 14px; }
 
@@ -688,8 +694,11 @@
     }
 
     // ---- график работы ----
-    var calY, calM, calMode = 'work',
-        KINDS = [['work', 'Рабочий', 'on'], ['sick', 'Больничный', 'sick'], ['vacation', 'Отпуск', 'vac']];
+    // Один тип на день. Тап по дню показывает информацию под календарём; владелец меняет тип кнопками там же.
+    var calY, calM, calSel = null,
+        KINDS = [['work', 'Рабочий', 'k-work'], ['sick', 'Больничный', 'k-sick'], ['vacation', 'Отпуск', 'k-vac']],
+        DAYCLS = {work: 'on', sick: 'sick', vacation: 'vac'},
+        INFO = {work: 'На работе с 09:00-18:00', sick: 'На больничном', vacation: 'В отпуске'};
     function pad(n) { return (n < 10 ? '0' : '') + n; }
 
     function schedMap() {
@@ -700,11 +709,18 @@
       return map;
     }
 
+    function fmtDate(k) {
+      var p = k.split('-');
+      return new Date(+p[0], +p[1] - 1, +p[2]).toLocaleDateString('ru-RU', {weekday: 'long', day: 'numeric', month: 'long'});
+    }
+
     function scheduleView() {
       var d = new Date();
       calY = d.getFullYear(); calM = d.getMonth();
-      sub('График работы', '<div id="cal"></div>');
-      document.querySelector('.sub-head').insertAdjacentHTML('beforeend', '<div class="stitle cnt" id="cnt"></div>');
+      calSel = calY + '-' + pad(calM + 1) + '-' + pad(d.getDate());
+      sub('', '<div id="cal"></div>');
+      var sh = document.querySelector('.sub-head');
+      if (sh) sh.remove(); // остаётся только системная кнопка «Назад» Telegram
       $('cal').onclick = function(e) {
         var m = e.target.closest('[data-m]');
         if (m) {
@@ -714,16 +730,33 @@
           drawCal();
           return;
         }
-        var md = e.target.closest('[data-mode]');
-        if (md) { calMode = md.getAttribute('data-mode'); drawCal(); return; }
         var k = e.target.closest('[data-k]');
-        if (k && me.isAdmin) toggleDay(k.getAttribute('data-k'));
+        if (k) { calSel = k.getAttribute('data-k'); drawCal(); return; }
+        var t = e.target.closest('[data-t]');
+        if (t && me.isAdmin && calSel) toggleDay(calSel, t.getAttribute('data-t'));
       };
       if (cache.schedule) drawCal();
       else {
         $('cal').innerHTML = '<div class="empty">Загрузка…</div>';
         getData('schedule').then(drawCal).catch(function() { if ($('cal')) $('cal').innerHTML = '<div class="empty">Не удалось загрузить.</div>'; });
       }
+    }
+
+    function infoHtml(map) {
+      var kind = map[calSel] || null,
+          h = '<div class="cal-info"><div class="cal-it">' + esc(fmtDate(calSel)) + '</div>';
+      if (me.isAdmin) {
+        h += '<div class="cal-chips">' + KINDS.map(function(x) {
+          return '<button class="cal-chip' + (kind === x[0] ? ' sel' : '') + '" data-t="' + x[0] + '"><i class="' + x[2] + '"></i>' + x[1] + '</button>';
+        }).join('') + '</div>';
+      }
+      if (kind) {
+        var dot = KINDS.filter(function(x) { return x[0] === kind; })[0][2];
+        h += '<div class="cal-line"><i class="' + dot + '"></i><span>' + esc(INFO[kind]) + '</span></div>';
+      } else if (!me.isAdmin) {
+        h += '<div class="cal-note">Отметок нет</div>';
+      }
+      return h + '</div>';
     }
 
     function drawCal() {
@@ -735,37 +768,30 @@
           n = new Date(calY, calM + 1, 0).getDate(),
           t = new Date(),
           tk = t.getFullYear() + '-' + pad(t.getMonth() + 1) + '-' + pad(t.getDate()),
-          cls = {work: 'on', sick: 'sick', vacation: 'vac'},
-          dot = {work: 'k-work', sick: 'k-sick', vacation: 'k-vac'},
-          html = '', i;
-      if (me.isAdmin) {
-        html += '<div class="cal-modes">' + KINDS.map(function(x) {
-          return '<button class="cal-mode' + (calMode === x[0] ? ' sel' : '') + '" data-mode="' + x[0] + '"><i class="' + dot[x[0]] + '"></i>' + x[1] + '</button>';
-        }).join('') + '</div>';
-      }
+          pre = calY + '-' + pad(calM + 1) + '-', shifts = 0, r10, r100, cnt, html = '', i;
+      Object.keys(map).forEach(function(d) { if (d.indexOf(pre) === 0 && map[d] === 'work') shifts++; });
+      r10 = shifts % 10; r100 = shifts % 100;
+      cnt = shifts + ' ' + (r10 === 1 && r100 !== 11 ? 'смена' : (r10 >= 2 && r10 <= 4 && (r100 < 12 || r100 > 14) ? 'смены' : 'смен'));
+
+      html += '<div class="cal-top"><div class="stitle">График работы</div><div class="stitle cnt" id="cnt">' + cnt + '</div></div>';
       html += '<div class="cal-h"><button class="ib" data-m="-1" aria-label="Назад">' + ico('back') + '</button>' +
         '<div class="cal-t">' + first.toLocaleDateString('ru-RU', {month: 'long', year: 'numeric'}) + '</div>' +
         '<button class="ib" data-m="1" aria-label="Вперёд">' + ico('next') + '</button></div><div class="cal-g">';
       ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'].forEach(function(w) { html += '<div class="cal-w">' + w + '</div>'; });
       for (i = 0; i < off; i++) html += '<div class="cal-d e"></div>';
       for (i = 1; i <= n; i++) {
-        var key = calY + '-' + pad(calM + 1) + '-' + pad(i), k = map[key];
-        html += '<button class="cal-d' + (k ? ' ' + cls[k] : '') + (key === tk ? ' today' : '') + (me.isAdmin ? '' : ' ro') + '" data-k="' + key + '">' + i + '</button>';
+        var key = pre + pad(i), k = map[key];
+        html += '<button class="cal-d' + (k ? ' ' + DAYCLS[k] : '') + (key === tk ? ' today' : '') + (key === calSel ? ' sel' : '') + '" data-k="' + key + '">' + i + '</button>';
       }
       html += '</div><div class="cal-leg">' + KINDS.map(function(x) {
-        return '<span><i class="' + dot[x[0]] + '"></i>' + x[1] + '</span>';
-      }).join('') + '</div>';
-      if (me.isAdmin) html += '<div class="cal-note">Выберите тип и нажимайте на дни. Повторный тап по тому же типу снимает отметку.</div>';
+        return '<span><i class="' + x[2] + '"></i>' + x[1] + '</span>';
+      }).join('') + '</div>' + infoHtml(map);
       box.innerHTML = html;
-      var pre = calY + '-' + pad(calM + 1) + '-', shifts = 0, c = $('cnt'), r10, r100;
-      Object.keys(map).forEach(function(d) { if (d.indexOf(pre) === 0 && map[d] === 'work') shifts++; });
-      r10 = shifts % 10; r100 = shifts % 100;
-      if (c) c.textContent = shifts + ' ' + (r10 === 1 && r100 !== 11 ? 'смена' : (r10 >= 2 && r10 <= 4 && (r100 < 12 || r100 > 14) ? 'смены' : 'смен'));
     }
 
-    function toggleDay(k) {
+    function toggleDay(k, kind) {
       var prev = schedMap()[k] || null,
-          next = prev === calMode ? null : calMode,
+          next = prev === kind ? null : kind,
           list = (cache.schedule || []).map(function(e) { return typeof e === 'string' ? {d: e, k: 'work'} : e; }),
           old = list.slice();
       list = list.filter(function(e) { return e.d !== k; });
