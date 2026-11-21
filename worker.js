@@ -1,7 +1,9 @@
 // Cloudflare Worker: бот обратной связи (замена Livegram)
 // D1-привязка: BD. Секреты: BOT_TOKEN, GROUP_ID, WEBHOOK_SECRET.
-// Необязательные переменные: WELCOME, AUTOREPLY, TZ_OFFSET (часы от UTC, по умолчанию 3 = Москва).
-// Для рассылок нужен Cron Trigger "* * * * *".
+// Необязательные переменные: WELCOME, AUTOREPLY, TZ_OFFSET (часы от UTC, по умолчанию 3 = Москва),
+//   NOTICE_TTL_SEC (секунды жизни уведомлений в General, по умолчанию 6),
+//   NOTICE_LONG_TTL_SEC (секунды жизни ответа на /app в General, по умолчанию 20).
+// Для рассылок и дочистки временных сообщений нужен Cron Trigger "* * * * *".
 // Mini App теперь лежит на GitHub Pages (файл index.html). Воркер отдаёт только API.
 // Переменная APP_URL: адрес Mini App (по умолчанию https://itsalexoncc-cell.github.io/support-bot-2/).
 // Доп. секрет: ADMIN_USER_ID (Telegram ID владельца; несколько аккаунтов: через запятую).
@@ -14,6 +16,7 @@
 const BATCH = 45; // сообщений рассылки за один запуск (лимит подзапросов на free-плане: 50)
 const AUTOREPLY_EVERY = 6 * 3600; // автоответ одному клиенту не чаще раза в 6 часов
 const DEFAULT_APP_URL = 'https://itsalexoncc-cell.github.io/support-bot-2/';
+const GENERAL_THREAD_ID = 1; // топик General в форуме
 
 const appUrl = (env) => env.APP_URL || DEFAULT_APP_URL;
 
@@ -35,6 +38,10 @@ const tg = (env, method, body) =>
 
 const esc = (s = '') => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 const now = () => Math.floor(Date.now() / 1000);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// Сколько секунд живёт временное сообщение (long: ответ с кнопкой, которую нужно успеть нажать)
+const noticeSec = (env, long = false) =>
+  Math.max(0, Number(long ? env.NOTICE_LONG_TTL_SEC ?? 20 : env.NOTICE_TTL_SEC ?? 6));
 
 export default {
   async fetch(req, env, ctx) {
@@ -51,6 +58,7 @@ export default {
       const cmds = await tg(env, 'setMyCommands', {
         scope: { type: 'chat', chat_id: Number(env.GROUP_ID) },
         commands: [
+          { command: 'del', description: 'Удалить сообщение (ответом на него)' },
           { command: 'ban', description: 'Заблокировать клиента' },
           { command: 'unban', description: 'Разблокировать клиента' },
           { command: 'app', description: 'Открыть мини-приложение' },
@@ -85,8 +93,9 @@ export default {
     return new Response('ok');
   },
 
-  // Cron: порционная отправка рассылок
+  // Cron: дочистка временных сообщений и порционная отправка рассылок
   async scheduled(event, env, ctx) {
+    ctx.waitUntil(sweepTemp(env));
     ctx.waitUntil(tickBroadcast(env).catch((e) => console.error('broadcast error', e)));
   },
 };
@@ -125,6 +134,68 @@ async function isWorkTime(env) {
   if (dow < d1 || dow > d2) return false;
   return a <= b ? h >= a && h < b : h >= a || h < b;
 }
+
+// ---------- временные сообщения и уведомления в General ----------
+// Временные сообщения записываются в базу: если воркер остановят до удаления, их дочистит cron или следующее уведомление
+let tempReady;
+const ensureTemp = (env) =>
+  (tempReady ||= env.BD.prepare(
+    'CREATE TABLE IF NOT EXISTS temp_msgs (chat_id TEXT NOT NULL, message_id INTEGER NOT NULL, delete_at INTEGER NOT NULL, PRIMARY KEY (chat_id, message_id))'
+  ).run().catch(() => {}));
+
+// Удаляет временные сообщения, которые не успели удалиться сами (запас в 30 секунд, чтобы не задеть живые)
+async function sweepTemp(env, limit = 5) {
+  try {
+    await ensureTemp(env);
+    const { results } = await env.BD.prepare('SELECT chat_id, message_id FROM temp_msgs WHERE delete_at < ? LIMIT ?')
+      .bind(now(), limit).all();
+    for (const t of results || []) {
+      const d = await tg(env, 'deleteMessage', { chat_id: t.chat_id, message_id: t.message_id });
+      if (d.error_code === 429) break; // Telegram просит подождать, повторим в следующий раз
+      await env.BD.prepare('DELETE FROM temp_msgs WHERE chat_id = ? AND message_id = ?').bind(t.chat_id, t.message_id).run();
+    }
+  } catch (e) {
+    console.error('sweep error', e);
+  }
+}
+
+// Отправляет временное сообщение и через несколько секунд удаляет его
+async function flash(env, params, seconds = noticeSec(env)) {
+  try {
+    await sweepTemp(env);
+    const r = await tg(env, 'sendMessage', params);
+    if (!r.ok) return r;
+    const chat = String(params.chat_id);
+    const id = r.result.message_id;
+    await env.BD.prepare('INSERT OR REPLACE INTO temp_msgs (chat_id, message_id, delete_at) VALUES (?, ?, ?)')
+      .bind(chat, id, now() + Math.ceil(seconds) + 30).run().catch(() => {});
+    await sleep(seconds * 1000);
+    const d = await tg(env, 'deleteMessage', { chat_id: params.chat_id, message_id: id });
+    if (d.ok || /not found/i.test(d.description || '')) {
+      await env.BD.prepare('DELETE FROM temp_msgs WHERE chat_id = ? AND message_id = ?').bind(chat, id).run().catch(() => {});
+    }
+    return r;
+  } catch (e) {
+    console.error('flash error', e);
+  }
+}
+
+// Уведомление в General, исчезает само. С groupMsgId это ответ на сообщение из топика, без него (null) просто сообщение.
+// Если Telegram не принял ответ на сообщение из другого топика, шлём в General без привязки.
+async function generalNotice(env, groupMsgId, text) {
+  const base = { chat_id: env.GROUP_ID, text, disable_notification: true };
+  const r = await flash(env, {
+    ...base,
+    message_thread_id: GENERAL_THREAD_ID,
+    ...(groupMsgId ? { reply_parameters: { message_id: groupMsgId, allow_sending_without_reply: true } } : {}),
+  });
+  if (!r?.ok) await flash(env, base);
+}
+
+// Сообщение у клиента уже исчезло: для нас это тоже успех
+const deleteOk = (r) => r.ok || /message to delete not found/i.test(r.description || '');
+const deleteReason = (r) =>
+  /can't be deleted|too old/i.test(r.description || '') ? 'сообщение старше 48 часов' : r.description || 'ошибка';
 
 // ---------- клиент -> группа ----------
 async function fromUser(m, env) {
@@ -350,7 +421,21 @@ async function onEdit(m, env) {
     const row = await env.BD.prepare(
       'SELECT user_id, user_msg_id FROM messages WHERE group_msg_id = ?'
     ).bind(m.message_id).first();
-    if (!row) return;
+    if (!row) {
+      // Связи с сообщением у клиента нет (старше 3 суток или не доставлялось): предупреждаем в General на несколько секунд.
+      // Заметки «//», General и чужие топики не трогаем: их клиенту и не отправляли.
+      const tid = m.message_thread_id;
+      if (!tid || tid === GENERAL_THREAD_ID || (m.text || m.caption || '').startsWith('//')) return;
+      const topic = await env.BD.prepare('SELECT user_id FROM users WHERE topic_id = ?').bind(tid).first();
+      if (topic) {
+        await generalNotice(
+          env,
+          m.message_id,
+          '⚠️ Правка не передана клиенту: сообщение не связано с перепиской (возможно, старше 3 суток)'
+        );
+      }
+      return;
+    }
     const r = await mirrorEdit(env, m, row.user_id, row.user_msg_id);
     if (!r.ok && !/not modified/i.test(r.description || '') && m.message_thread_id) {
       await tg(env, 'sendMessage', {
@@ -397,24 +482,25 @@ async function isAdminId(env, userId) {
 }
 
 async function onCommand(m, env, cmd, arg) {
-  const known = ['ban', 'unban', 'app'];
+  const known = ['ban', 'unban', 'app', 'del', 'delete'];
   if (!known.includes(cmd)) return false; // неизвестная команда: пересылаем как обычное сообщение
 
-  const say = (text, extra = {}) =>
-    tg(env, 'sendMessage', {
-      chat_id: m.chat.id,
-      message_thread_id: m.message_thread_id,
-      text,
-      parse_mode: 'HTML',
-      ...extra,
-    });
+  const isGeneral = !m.message_thread_id || m.message_thread_id === GENERAL_THREAD_ID;
+
+  // В топике ответ остаётся. В General ничего не копится: команда убирается сразу, ответ через несколько секунд
+  const say = async (text, extra = {}, long = false) => {
+    const params = { chat_id: m.chat.id, message_thread_id: m.message_thread_id, text, parse_mode: 'HTML', ...extra };
+    if (!isGeneral) return tg(env, 'sendMessage', params);
+    await tg(env, 'deleteMessage', { chat_id: m.chat.id, message_id: m.message_id }).catch(() => {});
+    return flash(env, params, noticeSec(env, long));
+  };
 
   // /app в группе: кнопка-ссылка (inline web_app работает только в личке; ссылка на Mini App из BotFather /newapp, short name в APP_SHORT, по умолчанию card)
   if (cmd === 'app') {
     const uname = await botUsername(env);
     await say('Мини-приложение:', {
       reply_markup: { inline_keyboard: [[{ text: 'Открыть', url: `https://t.me/${uname}/${env.APP_SHORT || 'card'}?mode=compact` }]] },
-    });
+    }, true);
     return true;
   }
 
@@ -426,9 +512,14 @@ async function onCommand(m, env, cmd, arg) {
     return true;
   }
 
+  if (cmd === 'del' || cmd === 'delete') {
+    await onDelete(m, env);
+    return true;
+  }
+
   if (cmd === 'ban' || cmd === 'unban') {
     let uid = Number(arg) || null;
-    if (!uid && m.message_thread_id) {
+    if (!uid && m.message_thread_id && m.message_thread_id !== GENERAL_THREAD_ID) {
       const r = await env.BD.prepare('SELECT user_id FROM users WHERE topic_id = ?').bind(m.message_thread_id).first();
       uid = r?.user_id;
     }
@@ -444,6 +535,71 @@ async function onCommand(m, env, cmd, arg) {
   }
 
   return false;
+}
+
+// ---------- удаление сообщений (/del) ----------
+async function onDelete(m, env) {
+  const tid = m.message_thread_id;
+  const target = m.reply_to_message;
+  const dropCommand = () =>
+    tg(env, 'deleteMessage', { chat_id: m.chat.id, message_id: m.message_id }).catch(() => {});
+
+  const user =
+    tid && tid !== GENERAL_THREAD_ID
+      ? await env.BD.prepare('SELECT user_id FROM users WHERE topic_id = ?').bind(tid).first()
+      : null;
+
+  // без ответа на конкретное сообщение reply_to_message в топике указывает на его заголовок
+  if (!user || !target || target.forum_topic_created || target.message_id === tid) {
+    await dropCommand();
+    await flash(env, {
+      chat_id: m.chat.id,
+      ...(tid ? { message_thread_id: tid } : {}),
+      text: 'Ответьте командой /del на сообщение в топике клиента, которое нужно удалить.',
+      disable_notification: true,
+    });
+    return;
+  }
+  await dropCommand();
+
+  const row = await env.BD.prepare(
+    'SELECT user_msg_id AS u FROM messages WHERE user_id = ? AND group_msg_id = ?'
+  ).bind(user.user_id, target.message_id).first();
+  if (!row) {
+    await generalNotice(env, target.message_id, '⚠️ Не удалено: сообщение старше 48 часов или не относится к переписке с клиентом');
+    return;
+  }
+
+  // удаляем у клиента (и его сообщение, и копию нашего: бот может удалять и то и другое в личке)
+  const del = await tg(env, 'deleteMessage', { chat_id: user.user_id, message_id: row.u });
+  if (!deleteOk(del)) {
+    await generalNotice(env, target.message_id, '⚠️ Не удалено: ' + deleteReason(del));
+    return;
+  }
+  await env.BD.prepare('DELETE FROM messages WHERE user_id = ? AND group_msg_id = ?')
+    .bind(user.user_id, target.message_id).run().catch(() => {});
+
+  const fromClient = target.from?.is_bot && !target.sender_chat;
+  if (!fromClient) {
+    // своё сообщение: у клиента удалено, убираем и у себя в топике
+    const d = await tg(env, 'deleteMessage', { chat_id: m.chat.id, message_id: target.message_id });
+    if (!deleteOk(d)) {
+      await generalNotice(env, target.message_id, '⚠️ У клиента удалено, а в топике не получилось: ' + (d.description || 'ошибка'));
+    }
+    return;
+  }
+
+  // сообщение клиента: в топике остаётся пометка вместо содержимого
+  const text = '🗑 Сообщение удалено';
+  const e = await tg(env, 'editMessageText', { chat_id: m.chat.id, message_id: target.message_id, text });
+  if (e.ok || /not modified/i.test(e.description || '')) return;
+  // пересланное или медиа-сообщение текстом не заменить: удаляем его из топика, а «Сообщение удалено» на несколько секунд показываем в General
+  const d = await tg(env, 'deleteMessage', { chat_id: m.chat.id, message_id: target.message_id });
+  if (!deleteOk(d)) {
+    await generalNotice(env, target.message_id, '⚠️ У клиента удалено, а в топике не получилось: ' + (d.description || 'ошибка'));
+    return;
+  }
+  await generalNotice(env, null, text);
 }
 
 async function onCallback(q, env) {
@@ -593,6 +749,7 @@ async function ensureSchema(env) {
   await run('schedule', "CREATE TABLE IF NOT EXISTS schedule (day TEXT PRIMARY KEY, kind TEXT DEFAULT 'work')");
   await run('schedule_kind', "ALTER TABLE schedule ADD COLUMN kind TEXT DEFAULT 'work'");
   await run('pins', 'CREATE TABLE IF NOT EXISTS pins (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, group_msg_id INTEGER, text TEXT NOT NULL, created_at INTEGER)');
+  await run('temp_msgs', 'CREATE TABLE IF NOT EXISTS temp_msgs (chat_id TEXT NOT NULL, message_id INTEGER NOT NULL, delete_at INTEGER NOT NULL, PRIMARY KEY (chat_id, message_id))');
   return out;
 }
 
