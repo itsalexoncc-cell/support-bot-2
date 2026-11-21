@@ -46,6 +46,24 @@
     #list { flex: 1; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; padding-bottom: 4px; }
     #list::-webkit-scrollbar { display: none; }
 
+    #home-view {
+      flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 10px;
+      overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; padding-bottom: 4px;
+    }
+    #home-view::-webkit-scrollbar { display: none; }
+    .ad-banner {
+      display: none; flex: none; margin: auto 0;
+      border-radius: 26px; overflow: hidden; background: var(--panel);
+      box-shadow: 0 6px 20px rgba(0,0,0,.14); text-decoration: none;
+      transition: transform .12s;
+    }
+    .ad-banner.on { display: block; }
+    .ad-banner.link { cursor: pointer; }
+    .ad-banner.link:active { transform: scale(.98); }
+    .ad-banner img { display: block; width: 100%; height: auto; pointer-events: none; }
+    .fsep { height: 1px; background: rgba(128,128,128,.2); margin: 4px 0; }
+    .btn.danger { background: rgba(229,72,77,.14); color: #e5484d; }
+
     .hero {
       flex: none;
       position: relative;
@@ -390,11 +408,85 @@
       return '<button type="button" data-c="' + kind + '" data-v="' + esc(val) + '"><span class="b">' + ico(kind) + '</span>' + label + '</button>';
     }
 
+    var bannerUrl = null, bannerVer = null, bannerReq = null;
+
+    function bannerVisible() {
+      return !!(me && me.banner && me.banner.exists && !me.banner.hidden);
+    }
+
+    function bannerReset() {
+      if (bannerUrl) { try { URL.revokeObjectURL(bannerUrl); } catch(e) {} }
+      bannerUrl = null; bannerVer = null; bannerReq = null;
+    }
+
+    function bannerLoad() {
+      if (!bannerVisible()) return;
+      var v = me.banner.v || 1;
+      if (bannerUrl && bannerVer === v) {
+        var el = $('ad-banner'), im = $('ad-img');
+        if (el && im) { im.src = bannerUrl; el.classList.add('on'); }
+        return;
+      }
+      if (!bannerReq || bannerVer !== v) {
+        bannerReset();
+        bannerVer = v;
+        bannerReq = api('/api/banner?v=' + v)
+          .then(function(r) { return r.blob(); })
+          .then(function(b) { return (bannerUrl = URL.createObjectURL(b)); })
+          .catch(function() { bannerReq = null; return null; });
+      }
+      bannerReq.then(function(u) {
+        var el = $('ad-banner'), im = $('ad-img');
+        if (u && el && im && el.isConnected && bannerVisible() && (me.banner.v || 1) === v) {
+          im.src = u;
+          el.classList.add('on');
+        }
+      });
+    }
+
+    function bannerEncode(file) {
+      return createImageBitmap(file).then(function(img) {
+        var s = Math.min(1, 1000 / Math.max(img.width, img.height)),
+            c = document.createElement('canvas'), x;
+        c.width = Math.max(1, Math.round(img.width * s));
+        c.height = Math.max(1, Math.round(img.height * s));
+        x = c.getContext('2d');
+        x.drawImage(img, 0, 0, c.width, c.height);
+        var mime = 'image/webp', d = c.toDataURL(mime, 0.88), b64;
+        if (d.indexOf('data:image/webp;base64,') === 0) {
+          b64 = d.split(',')[1];
+          if (b64.length > 680000) b64 = c.toDataURL(mime, 0.7).split(',')[1];
+          return {img: b64, mime: mime};
+        }
+        if (file.type === 'image/png') {
+          var pd = c.toDataURL('image/png'), pb = pd.split(',')[1];
+          if (pb.length <= 680000) return {img: pb, mime: 'image/png'};
+        }
+        mime = 'image/jpeg';
+        x.globalCompositeOperation = 'destination-over';
+        x.fillStyle = '#000';
+        x.fillRect(0, 0, c.width, c.height);
+        b64 = c.toDataURL(mime, 0.88).split(',')[1];
+        if (b64.length > 680000) b64 = c.toDataURL(mime, 0.7).split(',')[1];
+        return {img: b64, mime: mime};
+      });
+    }
+
     function shell() {
       setBack(false);
-      var h = me.header;
+      var h = me.header,
+          bShow = bannerVisible(),
+          bUrl = bShow ? (me.banner.url || '') : '',
+          bReady = bShow && bannerUrl && bannerVer === (me.banner.v || 1),
+          bHtml = bShow
+            ? '<a class="ad-banner' + (bReady ? ' on' : '') + (bUrl ? ' link' : '') + '" id="ad-banner"' +
+                (bUrl ? ' href="' + esc(bUrl) + '" target="_blank" rel="noopener"' : '') + '>' +
+                '<img id="ad-img"' + (bReady ? ' src="' + bannerUrl + '"' : '') + ' alt="">' +
+              '</a>'
+            : '';
       app.innerHTML =
         '<div id="stage">' +
+          '<div id="home-view">' +
           '<div class="hero" id="hero">' +
             (me.isAdmin ? '<button class="ib" id="ed" aria-label="Редактировать">' + ico('edit') + '</button>' : '') +
             '<div class="hero-top">' +
@@ -409,6 +501,8 @@
                 : '<p class="none">Не заполнено</p>') +
             '</div>' +
           '</div>' +
+          bHtml +
+          '</div>' +
           '<div id="body"></div>' +
         '</div>' +
         '<div class="dock"><nav class="nav">' +
@@ -416,7 +510,20 @@
         '</nav></div>';
 
       photosLoad();
+      bannerLoad();
       app.onclick = function(e) {
+        var ad = e.target.closest('#ad-banner');
+        if (ad) {
+          e.preventDefault();
+          var u = me && me.banner && me.banner.url;
+          if (!u) return;
+          try {
+            if (/^https?:\/\/(t\.me|telegram\.me)\//i.test(u) && tg && tg.openTelegramLink) tg.openTelegramLink(u);
+            else if (tg && tg.openLink) tg.openLink(u);
+            else window.open(u, '_blank');
+          } catch(_) { location.href = u; }
+          return;
+        }
         var t = e.target.closest('[data-tab]');
         if (t) { tab = t.getAttribute('data-tab'); showTab(); return; }
         var c = e.target.closest('[data-c]');
@@ -438,14 +545,15 @@
       [].forEach.call(app.querySelectorAll('.nav button'), function(b) {
         b.classList.toggle('on', b.getAttribute('data-tab') === tab);
       });
-      var hero = $('hero'), body = $('body');
+      var home = $('home-view'), body = $('body');
       if (tab === 'home') {
-        hero.style.display = 'flex';
+        home.style.display = 'flex';
         body.style.display = 'none';
         body.innerHTML = '';
+        bannerLoad();
         return;
       }
-      hero.style.display = 'none';
+      home.style.display = 'none';
       body.style.display = 'flex';
       var title = TABS.filter(function(t) { return t[0] === tab; })[0][1],
           canAdd = (tab === 'notifications' || tab === 'pins') && me.isAdmin;
@@ -648,6 +756,8 @@
 
     function editHeader() {
       var h = me.header,
+          bn = me.banner || {exists: false, hidden: false, url: ''},
+          bnSt = bn.exists ? (bn.hidden ? 'загружен · скрыт' : 'загружен · показан') : 'не загружен',
           f = [['title', 'Должность'], ['company', 'Место работы'], ['phone', 'Телефон'], ['email', 'Почта']];
       sub('Информация',
         f.map(function(x) {
@@ -655,6 +765,11 @@
         }).join('') +
         '<div class="fgrp"><label>QR-код бота (' + (me.qr ? 'загружен' : 'не загружен') + ')</label><input type="file" id="qrf" accept="image/*"></div>' +
         (me.qr ? '<button class="btn ghost" id="qrd">Удалить QR-код</button>' : '') +
+        '<div class="fsep"></div>' +
+        '<div class="fgrp"><label>Баннер (' + bnSt + ')</label><input type="file" id="bnf" accept="image/*"></div>' +
+        '<div class="fgrp"><label>Ссылка баннера (бот или сайт)</label><input id="bnu" maxlength="300" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="https://t.me/Ghataimodel_bot" value="' + esc(bn.url || '') + '"></div>' +
+        (bn.exists ? '<button class="btn ghost" id="bnt">' + (bn.hidden ? 'Показать баннер' : 'Скрыть баннер') + '</button>' : '') +
+        (bn.exists ? '<button class="btn danger" id="bnd">Удалить баннер</button>' : '') +
         '<button class="btn" id="ok">Сохранить</button>'
       );
       if ($('qrd')) $('qrd').onclick = function() {
@@ -664,16 +779,51 @@
             .catch(function() { msg('Не удалось удалить'); });
         });
       };
+      if ($('bnt')) $('bnt').onclick = function() {
+        var nextHidden = !(me.banner && me.banner.hidden);
+        j('/api/banner', {method: 'POST', body: JSON.stringify({hidden: nextHidden})}).then(function(r) {
+          me.banner = r.banner;
+          saveMe();
+          try { tg.HapticFeedback.notificationOccurred('success'); } catch(e) {}
+          shell();
+        }).catch(function(e) {
+          msg(e && e.msg && /[а-яА-Я]/.test(e.msg) ? e.msg : 'Не удалось сохранить');
+        });
+      };
+      if ($('bnd')) $('bnd').onclick = function() {
+        tg.showConfirm('Удалить баннер?', function(ok) {
+          if (!ok) return;
+          j('/api/banner', {method: 'DELETE'}).then(function(r) {
+            me.banner = r.banner;
+            bannerReset();
+            saveMe();
+            shell();
+          }).catch(function() { msg('Не удалось удалить'); });
+        });
+      };
       $('ok').onclick = function() {
-        var b = {}, file = $('qrf').files[0];
+        var okBtn = $('ok'), b = {}, file = $('qrf').files[0], bfile = $('bnf').files[0],
+            burl = $('bnu').value.trim(), curUrl = (me.banner && me.banner.url) || '';
         f.forEach(function(x) { b[x[0]] = $('f_' + x[0]).value.trim(); });
+        okBtn.disabled = true; okBtn.textContent = 'Сохранение…';
         j('/api/header', {method: 'PUT', body: JSON.stringify(b)}).then(function(r) {
           me.header = r.header;
           if (!file) return;
           return qrPng(file).then(function(png) {
             return j('/api/qr', {method: 'POST', body: JSON.stringify({png: png})});
           }).then(function() { me.qr = true; qrUrl = null; });
+        }).then(function() {
+          if (bfile) {
+            return bannerEncode(bfile).then(function(enc) {
+              return j('/api/banner', {method: 'POST', body: JSON.stringify({img: enc.img, mime: enc.mime, url: burl, hidden: false})});
+            }).then(function(r) { me.banner = r.banner; bannerReset(); });
+          }
+          if (burl !== curUrl) {
+            return j('/api/banner', {method: 'POST', body: JSON.stringify({url: burl})})
+              .then(function(r) { me.banner = r.banner; });
+          }
         }).then(function() { saveMe(); shell(); }).catch(function(e) {
+          okBtn.disabled = false; okBtn.textContent = 'Сохранить';
           msg(e && e.msg && /[а-яА-Я]/.test(e.msg) ? e.msg : 'Не удалось сохранить (ошибка ' + ((e && e.status) || 'сети') + ')');
         });
       };
