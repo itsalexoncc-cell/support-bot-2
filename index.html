@@ -285,8 +285,13 @@
 
     // Кэш: повторный запрос идёт в сеть только при force
     var inflight = {};
+    var boot = null;   // общий запрос запуска (/api/bootstrap): пока он в пути, вкладки ждут его, а не шлют свои
     function getData(key, force) {
       if (!force && cache[key]) return Promise.resolve(cache[key]);
+      if (!force && boot) {
+        return boot.then(function() { return cache[key] || getData(key); },
+                         function() { return getData(key); });
+      }
       if (!force && inflight[key]) return inflight[key];
       var p = j(URLS[key]).then(function(d) {
         delete inflight[key];
@@ -398,7 +403,7 @@
       }
       if (tg.showPopup) {
         tg.showPopup({
-          title: val, message: '\u2800',
+          title: val, message: '⠀',
           buttons: [{id: 'go', type: 'default', text: go}, {id: 'cp', type: 'default', text: cp}, {type: 'cancel'}]
         }, act);
       } else if (confirm(go + '?')) act('go');
@@ -983,13 +988,14 @@
       if (!me.isAdmin) return;
       var shown = false;
       j('/api/avatars/pending').then(function(d) {
-        var q = d.items.slice();
+        var q = d.items.slice(), made = 0;
         (function next() {
           var it = q.shift();
-          if (!it) { getData('avlog', true).then(function() { if (tab === 'notifications') showTab(); }, function() {}); return; }
+          // журнал уже пришёл в /api/bootstrap: перезапрашиваем его, только если что-то обработали
+          if (!it) { if (made) getData('avlog', true).then(function() { if (tab === 'notifications') showTab(); }, function() {}); return; }
           circlePng(it).then(function(png) {
             return j('/api/avatars/emoji', {method: 'POST', body: JSON.stringify({ref: it.ref, png: png})});
-          }).then(next, function(e) {
+          }).then(function() { made++; next(); }, function(e) {
             if (!shown) { shown = true; msg('Аватарки: ' + ((e && e.msg) || (e && e.status) || 'ошибка сети')); }
             next();
           });
@@ -1020,7 +1026,7 @@
       });
     }
 
-    // ---- запуск: всё грузится один раз ----
+    // ---- запуск: всё грузится ОДНИМ запросом /api/bootstrap ----
     if (!tg || !tg.initData) {
       app.innerHTML = '<div class="empty">Откройте приложение через кнопку меню в Telegram.</div>';
     } else {
@@ -1031,24 +1037,53 @@
       var saved = null;
       try { saved = JSON.parse(localStorage.getItem('me:' + API_BASE)); } catch(e) {}
 
-      // Шапка рисуется сразу (из памяти), остальное догружается в фоне
-      function start(d, fromCache) {
+      // Шапка рисуется сразу (из памяти); перерисовываем, только если она изменилась
+      function start(d) {
         var changed = !me || JSON.stringify(me) !== JSON.stringify(d);
         me = d;
         try { localStorage.setItem('me:' + API_BASE, JSON.stringify(d)); } catch(e) {}
         if (changed) shell();
-        if (fromCache) return;
-        quiet('colleagues').then(function(items) { (items || []).forEach(function(u) { photoLoad(u.ref); }); });
-        quiet('pins');
-        quiet('notifications');
-        quiet('schedule');
-        if (me.isAdmin) quiet('avlog');
+      }
+
+      // Фото коллег и очередь аватарок — когда данные уже на экране
+      function warm() {
+        (cache.colleagues || []).forEach(function(u) { photoLoad(u.ref); });
         avatarJob();
       }
 
-      if (saved && saved.header) start(saved, true);
+      // Запасной путь, если воркер ещё без /api/bootstrap: прежние отдельные запросы
+      function legacy() {
+        return j('/api/me').then(function(d) {
+          start(d);
+          quiet('colleagues').then(function(items) { (items || []).forEach(function(u) { photoLoad(u.ref); }); });
+          quiet('pins');
+          quiet('notifications');
+          quiet('schedule');
+          if (me.isAdmin) quiet('avlog');
+          avatarJob();
+        });
+      }
+
+      // Данные всех вкладок кладём в кэш до отрисовки; вкладки, открытые раньше, ждут этот запрос
+      var go = j('/api/bootstrap').then(function(d) {
+        boot = null;
+        cache.colleagues = d.colleagues || [];
+        cache.pins = d.pins || [];
+        cache.notifications = d.notifications || [];
+        cache.schedule = d.schedule || [];
+        if (d.me && d.me.isAdmin) cache.avlog = d.avlog || [];
+        return d;
+      }, function(e) { boot = null; throw e; });
+      boot = go;
+
+      if (saved && saved.header) start(saved);
       else app.innerHTML = '<div class="empty">Загрузка…</div>';
-      j('/api/me').then(function(d) { start(d, false); })
+
+      go.then(function(d) { start(d.me); warm(); })
+        .catch(function(e) {
+          if (e && e.status === 404) return legacy();
+          throw e;
+        })
         .catch(function(e) { if (!me || (e && (e.status === 401 || e.status === 403))) fail(e); });
     }
   </script>
